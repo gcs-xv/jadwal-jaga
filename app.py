@@ -1,8 +1,9 @@
 import re
 import csv
 import io
+import json
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, date as dt_date
 from supabase import create_client
 
 st.set_page_config(page_title="Jadwal Jaga Residen", layout="wide")
@@ -45,6 +46,21 @@ def get_roster_day(month: str, date: str):
         res = sb.table("roster_days").select("*").eq("month", month).eq("date", date).execute()
         return res.data[0] if res.data else None
     return sb_exec(run)
+
+# ---------- assignments helpers ----------
+def get_assignment(month: str, date: str):
+    def run():
+        res = sb.table("assignments").select("*").eq("month", month).eq("date", date).execute()
+        return res.data[0] if res.data else None
+    return sb_exec(run)
+
+def upsert_assignment(month: str, date: str, payload: dict):
+    def run():
+        sb.table("assignments").upsert(
+            {"month": month, "date": date, "payload": payload},
+            on_conflict="month,date"
+        ).execute()
+    sb_exec(run)
 
 # ---------- CSV import utils ----------
 REQUIRED_CSV_COLUMNS = [
@@ -123,6 +139,255 @@ def parse_roster_csv(uploaded_file):
         })
     return rows
 
+# ---------- Assignment generation ----------
+DAY_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+
+def iso_to_dayname(iso_date: str) -> str:
+    y, m, d = [int(x) for x in iso_date.split("-")]
+    wd = dt_date(y, m, d).weekday()  # Mon=0
+    return DAY_ID[wd]
+
+def parse_patients_lines(text: str):
+    """
+    Each non-empty line becomes one patient record.
+    Formats accepted:
+    - "Nama pasien"
+    - "Nama pasien | POD III" (for post-op)
+    - "Nama pasien | POD 0"
+    """
+    out = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = [p.strip() for p in ln.split("|")]
+        name = parts[0]
+        meta = parts[1] if len(parts) > 1 else ""
+        out.append({"name": name, "meta": meta})
+    return out
+
+def roman_to_int(r: str):
+    r = (r or "").strip().upper()
+    if r in ["0", "O"]:
+        return 0
+    vals = {"I": 1, "V": 5, "X": 10}
+    total = 0
+    prev = 0
+    for ch in reversed(r):
+        v = vals.get(ch, 0)
+        if v < prev:
+            total -= v
+        else:
+            total += v
+            prev = v
+    return total
+
+def int_to_roman(n: int):
+    if n <= 0:
+        return "0"
+    mapping = [
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ]
+    out = ""
+    for v, sym in mapping:
+        while n >= v:
+            out += sym
+            n -= v
+    return out
+
+def normalize_pod_label(meta: str):
+    meta = (meta or "").strip()
+    if not meta:
+        return None
+    m = re.search(r"POD\s*([0-9]+|[IVX]+)", meta, flags=re.IGNORECASE)
+    if not m:
+        return None
+    val = m.group(1)
+    if val.isdigit():
+        cur = int(val)
+        nxt = cur + 1
+        return (f"POD {cur}", f"POD {nxt}")
+    cur_i = roman_to_int(val)
+    nxt_i = cur_i + 1
+    return (f"POD {int_to_roman(cur_i)}", f"POD {int_to_roman(nxt_i)}")
+
+def pair_up(names: list[str]):
+    names = [n.strip() for n in (names or []) if n and n.strip()]
+    # deterministic pairing: sort then pair adjacent
+    names_sorted = sorted(names, key=lambda x: x.lower())
+    pairs = []
+    i = 0
+    while i < len(names_sorted):
+        if i + 1 < len(names_sorted):
+            pairs.append([names_sorted[i], names_sorted[i+1]])
+            i += 2
+        else:
+            pairs.append([names_sorted[i]])
+            i += 1
+    return pairs
+
+class Rotator:
+    def __init__(self, items: list):
+        self.items = items[:] if items else []
+        self.idx = 0
+
+    def next(self):
+        if not self.items:
+            return None
+        item = self.items[self.idx % len(self.items)]
+        self.idx += 1
+        return item
+
+def uniq(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if not x:
+            continue
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list, igds: list,
+                     erm_manual: str, review_manual: str):
+    a12 = roster.get("a12") or []
+    a13 = roster.get("a13") or []
+    a14 = roster.get("a14") or []
+    a15 = roster.get("a15") or []
+    observers = roster.get("observers") or []
+
+    a14_pairs = pair_up(a14)
+    a15_pairs = pair_up(a15)
+
+    r12 = Rotator(a12)
+    r13 = Rotator(a13)
+    r14 = Rotator(a14_pairs)
+    r15 = Rotator(a15_pairs)
+
+    def core_team():
+        lead12 = r12.next()
+        one13 = r13.next()
+        p14 = r14.next() or []
+        p15 = r15.next() or []
+        # core: 1 from 12, 1 from 13, 2 from 14, 2 from 15 (if available)
+        team = [lead12, one13] + list(p14) + list(p15)
+        return uniq([t for t in team if t])
+
+    def small_team(include12=True):
+        lead12 = r12.next() if include12 else None
+        one13 = r13.next()
+        p14 = r14.next() or []
+        p15 = r15.next() or []
+        team = [lead12, one13]
+        if p14:
+            team.append(p14[0])
+        if p15:
+            team.append(p15[0])
+        return uniq([t for t in team if t])
+
+    out = {
+        "date": iso_date,
+        "day_name": iso_to_dayname(iso_date),
+        "pilot": roster.get("pilot", ""),
+        "copilot": roster.get("copilot", ""),
+        "observer": observers,
+        "erm_manual": erm_manual or "",
+        "review_manual": review_manual or "",
+        "post_op": [],
+        "pre_op": [],
+        "igd": [],
+    }
+
+    # POST OP: each patient gets two POD lines (current and next)
+    for p in post_ops:
+        labels = normalize_pod_label(p.get("meta", "")) or ("POD I", "POD II")
+        t1 = core_team()
+        t2 = core_team()
+        out["post_op"].append({
+            "name": p["name"],
+            "pod_lines": [
+                {"label": labels[0], "team": t1},
+                {"label": labels[1], "team": t2},
+            ]
+        })
+
+    # PRE OP: SOAP, RM/ERM, TSR
+    for p in pre_ops:
+        t_core = core_team()
+        soap = small_team(include12=True)
+        tsr = small_team(include12=True)
+        out["pre_op"].append({
+            "name": p["name"],
+            "soap": soap,
+            "rm_erm": t_core,
+            "tsr": tsr,
+        })
+
+    # IGD: SOAP, RM/ERM, ER
+    for p in igds:
+        t_core = core_team()
+        soap = small_team(include12=True)
+        er = small_team(include12=False)
+        out["igd"].append({
+            "name": p["name"],
+            "soap": soap,
+            "rm_erm": t_core,
+            "er": er,
+        })
+
+    return out
+
+def format_wa_text(assign: dict) -> str:
+    day = assign["day_name"]
+    iso = assign["date"]
+    dd, mm, yyyy = iso.split("-")[2], iso.split("-")[1], iso.split("-")[0]
+    header = f"Pembagian tugas jaga {day}, {dd}/{mm}/{yyyy}\n\n"
+    header += f"Pilot : {assign.get('pilot','')}\n"
+    header += f"Co Pilot : {assign.get('copilot','')}\n\n"
+
+    lines = [header]
+
+    # POST OP
+    if assign.get("post_op"):
+        lines.append(f"{len(assign['post_op'])} Post Op\n")
+        for i, p in enumerate(assign["post_op"], start=1):
+            lines.append(f"{i}. {p['name']}\n")
+            for pl in p["pod_lines"]:
+                team = ", ".join(pl["team"])
+                lines.append(f"{pl['label']} : {team}\n")
+            lines.append("\n")
+
+    # PRE OP
+    if assign.get("pre_op"):
+        lines.append(f"{len(assign['pre_op'])} Pre op\n")
+        for i, p in enumerate(assign["pre_op"], start=1):
+            lines.append(f"{i}. {p['name']}\n")
+            lines.append(f"Soap : {', '.join(p['soap'])}\n")
+            lines.append(f"RM/ERM : {', '.join(p['rm_erm'])}\n")
+            lines.append(f"TSR : {', '.join(p['tsr'])}\n\n")
+
+    # IGD
+    if assign.get("igd"):
+        lines.append("IGD\n")
+        for i, p in enumerate(assign["igd"], start=1):
+            lines.append(f"{i}. {p['name']}\n")
+            lines.append(f"Soap : {', '.join(p['soap'])}\n")
+            lines.append(f"RM/ERM : {', '.join(p['rm_erm'])}\n")
+            lines.append(f"ER : {', '.join(p['er'])}\n\n")
+
+    # Footer
+    obs = ", ".join(assign.get("observer") or [])
+    lines.append(f"Observer : {obs}\n\n")
+    lines.append(f"ERM : {assign.get('erm_manual','')}\n")
+    lines.append(f"Review : {assign.get('review_manual','')}\n")
+
+    return "".join(lines)
+
 # ---------- UI ----------
 st.title("📅 Jadwal Jaga Residen (Import CSV → Roster Lengkap)")
 
@@ -145,7 +410,7 @@ with tab_use:
         if not r:
             st.info("Tanggal ini belum ada roster.")
         else:
-            st.subheader("Roster")
+            st.subheader("Tim Jaga (dari roster)")
             st.code(
                 "\n".join([
                     f"Tanggal: {r['date']}",
@@ -159,6 +424,73 @@ with tab_use:
                     f"Observer: {', '.join(r.get('observers',[]))}",
                 ])
             )
+
+            st.markdown("---")
+            st.subheader("Buat Pembagian Tugas Jaga")
+
+            saved = get_assignment(picked_month, picked_date)
+            saved_payload = saved["payload"] if saved and isinstance(saved.get("payload"), dict) else None
+
+            c1, c2 = st.columns(2)
+            with c1:
+                default_post = ""
+                default_pre = ""
+                default_igd = ""
+                if saved_payload:
+                    # reconstruct simple defaults from saved payload
+                    if saved_payload.get("post_op"):
+                        default_post = "\n".join([f"{p['name']} | {p['pod_lines'][0]['label']}" for p in saved_payload["post_op"]])
+                    if saved_payload.get("pre_op"):
+                        default_pre = "\n".join([p["name"] for p in saved_payload["pre_op"]])
+                    if saved_payload.get("igd"):
+                        default_igd = "\n".join([p["name"] for p in saved_payload["igd"]])
+
+                post_text = st.text_area(
+                    "POST OP (1 baris per pasien). Boleh: 'Nama | POD III' atau 'Nama | POD 0'",
+                    value=default_post,
+                    height=140
+                )
+                pre_text = st.text_area(
+                    "PRE OP (1 baris per pasien)",
+                    value=default_pre,
+                    height=140
+                )
+                igd_text = st.text_area(
+                    "IGD (1 baris per pasien)",
+                    value=default_igd,
+                    height=120
+                )
+
+            with c2:
+                default_erm = saved_payload.get("erm_manual","") if saved_payload else ""
+                default_rev = saved_payload.get("review_manual","") if saved_payload else ""
+                erm_manual = st.text_input("ERM (manual)", value=default_erm)
+                review_manual = st.text_input("Review (manual)", value=default_rev)
+
+                st.caption("Catatan: aturan pairing A14/A15 pada MVP ini dibuat otomatis (urut alfabet).")
+
+            post_ops = parse_patients_lines(post_text)
+            pre_ops = parse_patients_lines(pre_text)
+            igds = parse_patients_lines(igd_text)
+
+            if st.button("Generate Pembagian"):
+                assign = build_assignment(
+                    roster=r,
+                    iso_date=r["date"],
+                    post_ops=post_ops,
+                    pre_ops=pre_ops,
+                    igds=igds,
+                    erm_manual=erm_manual,
+                    review_manual=review_manual,
+                )
+                wa = format_wa_text(assign)
+                upsert_assignment(picked_month, picked_date, assign)
+
+                st.success("✅ Pembagian dibuat & disimpan.")
+                st.text_area("Output WA (copy-paste)", value=wa, height=420)
+
+            if saved_payload and not st.session_state.get("generated_once", False):
+                st.info("Ada pembagian tersimpan untuk tanggal ini. Klik 'Generate Pembagian' untuk regenerate dan overwrite.")
 
 with tab_admin:
     pin = st.text_input("Admin PIN", type="password")

@@ -74,9 +74,29 @@ def parse_roster_csv(uploaded_file):
     """
     raw = uploaded_file.getvalue()
     text = raw.decode("utf-8", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
+    # Handle common CSV quirks:
+    # - Excel/Sheets exports may use ';' as delimiter
+    # - Some files include UTF-8 BOM in the first header
+    sample = text[:4096]
 
-    missing = [c for c in REQUIRED_CSV_COLUMNS if c not in (reader.fieldnames or [])]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+    except Exception:
+        dialect = csv.excel  # default comma
+
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+
+    # Normalize headers (strip spaces, remove BOM)
+    fieldnames = []
+    for fn in (reader.fieldnames or []):
+        fn = (fn or "").strip().lstrip("\ufeff")
+        fieldnames.append(fn)
+
+    # Recreate reader with normalized fieldnames
+    if reader.fieldnames:
+        reader.fieldnames = fieldnames
+
+    missing = [c for c in REQUIRED_CSV_COLUMNS if c not in fieldnames]
     if missing:
         raise ValueError(f"CSV missing columns: {', '.join(missing)}")
 

@@ -1,0 +1,4 @@
+streamlit==1.32.2
+supabase==2.4.3
+pypdf==4.0.2
+python-dateutil==2.9.0.post0

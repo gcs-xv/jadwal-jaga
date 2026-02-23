@@ -283,6 +283,15 @@ with tab_admin:
 
     pdf = st.file_uploader("Upload PDF Jadwal Bulan Ini", type=["pdf"])
 
+    if pdf:
+    with pdfplumber.open(pdf) as debug_pdf:
+        raw = ""
+        for page in debug_pdf.pages:
+            raw += page.extract_text() + "\n"
+
+    st.subheader("DEBUG RAW TEXT (lihat struktur aslinya)")
+    st.text_area("Raw Extract", raw[:8000], height=300)
+
     if st.button("IMPORT PDF → isi roster_days", disabled=not is_admin):
         if not pdf:
             st.error("Upload PDF dulu.")

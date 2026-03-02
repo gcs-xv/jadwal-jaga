@@ -335,14 +335,25 @@ def pick_least_used(pool: list[str], k: int, used: dict, iso_date: str, salt: st
 
 def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list, igds: list,
                      erm_manual: str, review_manual: str):
+    """
+    Surgical rewrite of the ASSIGNMENT ENGINE only.
+    Goals:
+    - A16 is NOT an observer section; A16 participates and must appear fairly.
+    - Fairness is separated per section: POST OP vs PRE OP vs IGD.
+    - Multi-patient POST OP: each patient gets a stable team; teams are disjoint by cohort splits (so no identical teams).
+    - PRE/IGD: first distribute people per cohort across patients, then assign SOAP / RM-ERM / TSR(ER) using the per-patient buckets.
+      This prevents "A15/A16 only in RM/ERM" and keeps cohort order in output.
+    - Output order within each role line is ALWAYS A12 → A13 → A14 → A15 → A16.
+    """
+
     # Cohort pools (from roster)
     a12 = roster.get("a12") or []
     a13 = roster.get("a13") or []
     a14 = roster.get("a14") or []
     a15 = roster.get("a15") or []
-    a16 = roster.get("observers") or []  # A16 participates officially (no separate observer section)
+    a16 = roster.get("observers") or []  # A16 participates officially
 
-    # Deterministic shuffle per date (so regenerate same date => same result)
+    # Deterministic shuffle per date
     a12_s = shuffled(a12, iso_date, "rot:a12")
     a13_s = shuffled(a13, iso_date, "rot:a13")
     a14_s = shuffled(a14, iso_date, "rot:a14")
@@ -350,7 +361,6 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     a16_s = shuffled(a16, iso_date, "rot:a16")
 
     def cohort_order(team: list[str]) -> list[str]:
-        """Force output order: A12 → A13 → A14 → A15 → A16 (each in the roster-shuffled order)."""
         s = set(team or [])
         out = []
         for x in a12_s:
@@ -368,7 +378,7 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     def all_people() -> list[str]:
         return uniq(a12_s + a13_s + a14_s + a15_s + a16_s)
 
-    # Deterministic pairs for A14/A15 (pairing stays consistent within the date)
+    # Pairing for A14/A15 (stable per date)
     def make_pairs(xs: list[str]) -> list[list[str]]:
         pairs = []
         i = 0
@@ -384,122 +394,29 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     a14_pairs = make_pairs(a14_s)
     a15_pairs = make_pairs(a15_s)
 
-    class Rot:
-        def __init__(self, items):
-            self.items = items[:] if items else []
-            self.i = 0
-        def next(self):
-            if not self.items:
-                return None
-            v = self.items[self.i % len(self.items)]
-            self.i += 1
-            return v
+    def split_even_pairs(pairs: list[list[str]], n_groups: int, salt: str):
+        """Split a list of pairs evenly into n_groups, deterministically."""
+        if n_groups <= 0:
+            return []
+        # deterministic shuffle of pair "keys"
+        keys = list(range(len(pairs)))
+        rng = seeded_rng(iso_date, f"{salt}:pairs")
+        rng.shuffle(keys)
+        groups = [[] for _ in range(n_groups)]
+        for i, k in enumerate(keys):
+            groups[i % n_groups].extend([x for x in (pairs[k] or []) if x])
+        return groups
 
-    r12 = Rot(a12_s)
-    r13 = Rot(a13_s)
-    r14 = Rot(a14_pairs)
-    r15 = Rot(a15_pairs)
-    r16 = Rot(a16_s)
-
-    # Track who already got ANY jobdesk today
-    unused = set(all_people())
-
-    def take_from_rot(rot: Rot, k: int) -> list[str]:
-        picked = []
-        seen_guard = 0
-        while len(picked) < k and rot.items and seen_guard < (len(rot.items) * 3 + 10):
-            v = rot.next()
-            if v is None:
-                break
-            # v can be a pair list or a string
-            if isinstance(v, list):
-                for x in v:
-                    if x and x not in picked:
-                        picked.append(x)
-                        if len(picked) >= k:
-                            break
-            else:
-                if v and v not in picked:
-                    picked.append(v)
-            seen_guard += 1
-        return picked
-
-    def pick_k_for_role(k: int, salt: str) -> list[str]:
-        """
-        Pick k people prioritizing those still unused, but keep cohort structure.
-        We try to include: A12 (if exists), A13 (if exists), A14 pair, A15 pair, then A16,
-        then fill remaining from anyone.
-        """
-        k = max(1, min(k, len(all_people())))
-        picked = []
-
-        # 1) ensure 1 A12 + 1 A13 if possible (prefer unused)
-        if a12_s:
-            cand = [x for x in a12_s if x in unused]
-            picked += cand[:1] if cand else [a12_s[0]]
-        if a13_s and len(picked) < k:
-            cand = [x for x in a13_s if x in unused and x not in picked]
-            picked += cand[:1] if cand else [a13_s[0]]
-
-        # 2) add one A14 pair and one A15 pair (prefer unused inside the pair)
-        if len(picked) < k and a14_pairs:
-            pair = r14.next() or []
-            pair = [x for x in pair if x]
-            # prioritize unused members of the pair
-            pair_u = [x for x in pair if x in unused and x not in picked]
-            pair_r = [x for x in pair if x not in picked]
-            for x in (pair_u + pair_r):
-                if len(picked) < k and x not in picked:
-                    picked.append(x)
-
-        if len(picked) < k and a15_pairs:
-            pair = r15.next() or []
-            pair = [x for x in pair if x]
-            pair_u = [x for x in pair if x in unused and x not in picked]
-            pair_r = [x for x in pair if x not in picked]
-            for x in (pair_u + pair_r):
-                if len(picked) < k and x not in picked:
-                    picked.append(x)
-
-        # 3) add one A16 if available and still need
-        if len(picked) < k and a16_s:
-            cand = [x for x in a16_s if x in unused and x not in picked]
-            if cand:
-                picked.append(cand[0])
-            else:
-                # deterministic pick
-                picked.append(a16_s[0])
-
-        # 4) fill the rest by taking from everyone, prioritizing unused, deterministic by shuffled order
-        everyone = shuffled(all_people(), iso_date, f"fill:{salt}")
-        for x in everyone:
-            if len(picked) >= k:
-                break
-            if x in picked:
-                continue
-            # prefer unused first
-            if x in unused:
-                picked.append(x)
-        # if still short, allow repeats
-        for x in everyone:
-            if len(picked) >= k:
-                break
-            if x in picked:
-                continue
-            picked.append(x)
-
-        # mark used
-        for x in picked:
-            if x in unused:
-                unused.remove(x)
-
-        return cohort_order(picked)
+    def split_even_people(xs: list[str], n_groups: int, salt: str):
+        if n_groups <= 0:
+            return []
+        sh = shuffled(xs, iso_date, f"{salt}:people")
+        groups = [[] for _ in range(n_groups)]
+        for i, x in enumerate(sh):
+            groups[i % n_groups].append(x)
+        return groups
 
     def split_all_people_into_two_teams() -> tuple[list[str], list[str]]:
-        """
-        Split fairly within each cohort: roughly half to team1, rest to team2.
-        Keep cohort order in each team.
-        """
         t1 = []
         t2 = []
         for cohort in [a12_s, a13_s, a14_s, a15_s, a16_s]:
@@ -511,6 +428,75 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
             t2 += cohort[half:]
         return (cohort_order(t1), cohort_order(t2))
 
+    # ---- Role assignment from per-patient buckets ----
+    def assign_roles_from_buckets(buckets: dict, mode: str):
+        """
+        buckets: {"a12": [...], "a13": [...], "a14": [...], "a15": [...], "a16": [...]}
+        We CONSUME from buckets so people end up with exactly one primary jobdesk in this section.
+        For PRE: roles = SOAP (w1), TSR (w1), RM/ERM (w2). For IGD: TSR->ER.
+        Strategy:
+        - First, each role tries to take 1 person from each cohort (if available) -> ensures representation.
+        - Then fill remaining roles by consuming remaining people, prioritizing RM/ERM (weight 2) to hold the leftovers.
+        """
+        # Flatten helpers
+        def pop_one(cohort_key):
+            xs = buckets.get(cohort_key) or []
+            if xs:
+                return xs.pop(0)
+            return None
+
+        cohort_keys = ["a12", "a13", "a14", "a15", "a16"]
+
+        # Start with representation picks (up to 1 each cohort)
+        soap = []
+        rm = []
+        third = []  # TSR or ER
+
+        for k in cohort_keys:
+            x = pop_one(k)
+            if x: soap.append(x)
+        for k in cohort_keys:
+            x = pop_one(k)
+            if x: rm.append(x)
+        for k in cohort_keys:
+            x = pop_one(k)
+            if x: third.append(x)
+
+        # Remaining people: go to RM/ERM first (weight 2), then distribute a bit to SOAP/third if they are too small.
+        remaining = []
+        for k in cohort_keys:
+            remaining += (buckets.get(k) or [])
+
+        # Clear buckets (consumed)
+        for k in cohort_keys:
+            buckets[k] = []
+
+        # If we still have many remaining, keep RM as the sink (so everyone has a jobdesk and RM is heavier).
+        # But ensure SOAP and TSR/ER aren't tiny when there are plenty of people.
+        # Target minimums when possible:
+        # - If total >= 10: SOAP >= 5 and TSR/ER >= 5
+        total_now = len(soap) + len(rm) + len(third) + len(remaining)
+        if total_now >= 10:
+            # grow soap up to 5
+            while len(soap) < 5 and remaining:
+                soap.append(remaining.pop(0))
+            # grow third up to 5
+            while len(third) < 5 and remaining:
+                third.append(remaining.pop(0))
+
+        # everything else -> RM
+        rm += remaining
+
+        soap = cohort_order(soap)
+        rm = cohort_order(rm)
+        third = cohort_order(third)
+
+        if mode == "pre":
+            return {"soap": soap, "rm_erm": rm, "tsr": third}
+        else:
+            return {"soap": soap, "rm_erm": rm, "er": third}
+
+    # ---- Output payload ----
     out = {
         "date": iso_date,
         "day_name": iso_to_dayname(iso_date),
@@ -523,72 +509,101 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
         "igd": [],
     }
 
-    # ---------- POST OP ----------
-    total_post = len(post_ops)
-    for idx, p in enumerate(post_ops, start=1):
-        labels = normalize_pod_label(p.get("meta", "")) or ("POD I", "POD II")
+    # =========================
+    # POST OP
+    # =========================
+    if post_ops:
+        total_post = len(post_ops)
 
-        if total_post == 1:
-            team1, team2 = split_all_people_into_two_teams()
-            # Everyone gets jobdesk from post-op split
-            unused.clear()
-            out["post_op"].append({
+        for idx, p in enumerate(post_ops, start=1):
+            labels = normalize_pod_label(p.get("meta", "")) or ("POD I", "POD II")
+
+            if total_post == 1:
+                team1, team2 = split_all_people_into_two_teams()
+                out["post_op"].append({
+                    "name": p["name"],
+                    "pod_lines": [
+                        {"label": labels[0], "team": team1},
+                        {"label": labels[1], "team": team2},
+                    ]
+                })
+            else:
+                # stable team per patient: split each cohort across patients (disjoint, fair, includes A16)
+                n = total_post
+                t12 = split_even_people(a12_s, n, "post:a12")
+                t13 = split_even_people(a13_s, n, "post:a13")
+                t14 = split_even_pairs(a14_pairs, n, "post:a14pairs")
+                t15 = split_even_pairs(a15_pairs, n, "post:a15pairs")
+                t16 = split_even_people(a16_s, n, "post:a16")
+
+                i = idx - 1
+                team = cohort_order((t12[i] if t12 else []) + (t13[i] if t13 else []) + (t14[i] if t14 else []) +
+                                    (t15[i] if t15 else []) + (t16[i] if t16 else []))
+
+                out["post_op"].append({
+                    "name": p["name"],
+                    "pod_lines": [
+                        {"label": labels[0], "team": team},
+                        {"label": labels[1], "team": team},
+                    ]
+                })
+
+    # =========================
+    # PRE OP
+    # =========================
+    if pre_ops:
+        n = len(pre_ops)
+        # Distribute cohorts across PRE patients (so A15/A16 are split, not dumped into RM only)
+        t12 = split_even_people(a12_s, n, "pre:a12")
+        t13 = split_even_people(a13_s, n, "pre:a13")
+        t14 = split_even_pairs(a14_pairs, n, "pre:a14pairs")
+        t15 = split_even_pairs(a15_pairs, n, "pre:a15pairs")
+        t16 = split_even_people(a16_s, n, "pre:a16")
+
+        for idx, p in enumerate(pre_ops, start=1):
+            i = idx - 1
+            buckets = {
+                "a12": (t12[i] if t12 else [])[:],
+                "a13": (t13[i] if t13 else [])[:],
+                "a14": (t14[i] if t14 else [])[:],
+                "a15": (t15[i] if t15 else [])[:],
+                "a16": (t16[i] if t16 else [])[:],
+            }
+            roles = assign_roles_from_buckets(buckets, mode="pre")
+            out["pre_op"].append({
                 "name": p["name"],
-                "pod_lines": [
-                    {"label": labels[0], "team": team1},
-                    {"label": labels[1], "team": team2},
-                ]
+                "soap": roles["soap"],
+                "rm_erm": roles["rm_erm"],
+                "tsr": roles["tsr"],
             })
-        else:
-            # per patient: one stable team for both POD lines, size 6 (adapt)
-            k = min(6, max(1, len(all_people())))
-            team = pick_k_for_role(k, f"post{idx}")
-            out["post_op"].append({
+
+    # =========================
+    # IGD
+    # =========================
+    if igds:
+        n = len(igds)
+        t12 = split_even_people(a12_s, n, "igd:a12")
+        t13 = split_even_people(a13_s, n, "igd:a13")
+        t14 = split_even_pairs(a14_pairs, n, "igd:a14pairs")
+        t15 = split_even_pairs(a15_pairs, n, "igd:a15pairs")
+        t16 = split_even_people(a16_s, n, "igd:a16")
+
+        for idx, p in enumerate(igds, start=1):
+            i = idx - 1
+            buckets = {
+                "a12": (t12[i] if t12 else [])[:],
+                "a13": (t13[i] if t13 else [])[:],
+                "a14": (t14[i] if t14 else [])[:],
+                "a15": (t15[i] if t15 else [])[:],
+                "a16": (t16[i] if t16 else [])[:],
+            }
+            roles = assign_roles_from_buckets(buckets, mode="igd")
+            out["igd"].append({
                 "name": p["name"],
-                "pod_lines": [
-                    {"label": labels[0], "team": team},
-                    {"label": labels[1], "team": team},
-                ]
+                "soap": roles["soap"],
+                "rm_erm": roles["rm_erm"],
+                "er": roles["er"],
             })
-
-    # ---------- PRE OP ----------
-    # Role sizes (adapt down if fewer people)
-    k_soap = min(4, max(1, len(all_people())))
-    k_rm = min(6, max(1, len(all_people())))
-    k_tsr = min(4, max(1, len(all_people())))
-
-    for idx, p in enumerate(pre_ops, start=1):
-        soap = pick_k_for_role(k_soap, f"pre{idx}:soap")
-        rm_erm = pick_k_for_role(k_rm, f"pre{idx}:rm")
-        tsr = pick_k_for_role(k_tsr, f"pre{idx}:tsr")
-        out["pre_op"].append({
-            "name": p["name"],
-            "soap": soap,
-            "rm_erm": rm_erm,
-            "tsr": tsr,
-        })
-
-    # ---------- IGD ----------
-    k_er = min(3, max(1, len(all_people())))
-    for idx, p in enumerate(igds, start=1):
-        soap = pick_k_for_role(k_soap, f"igd{idx}:soap")
-        rm_erm = pick_k_for_role(k_rm, f"igd{idx}:rm")
-        er = pick_k_for_role(k_er, f"igd{idx}:er")
-        out["igd"].append({
-            "name": p["name"],
-            "soap": soap,
-            "rm_erm": rm_erm,
-            "er": er,
-        })
-
-    # If there are PRE/IGD tasks and some people are still unused, force-assign them into the last RM/ERM (append, keep order)
-    if (pre_ops or igds) and unused:
-        leftovers = cohort_order(list(unused))
-        if out["igd"]:
-            out["igd"][-1]["rm_erm"] = cohort_order(out["igd"][-1]["rm_erm"] + leftovers)
-        elif out["pre_op"]:
-            out["pre_op"][-1]["rm_erm"] = cohort_order(out["pre_op"][-1]["rm_erm"] + leftovers)
-        unused.clear()
 
     return out
 

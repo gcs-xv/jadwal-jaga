@@ -555,45 +555,57 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     if pre_ops:
         n = len(pre_ops)
 
-        # global usage tracker (fairness soft control)
-        usage = {}
+        # A15 workload fairness tracker (ONLY A15 counted)
+        a15_usage = {x: 0 for x in a15_s}
 
         for idx, p in enumerate(pre_ops, start=1):
-            # For EACH patient, start from FULL cohort pools
-            buckets = {
-                "a12": a12_s[:],
-                "a13": a13_s[:],
-                "a14": a14_s[:],
-                "a15": a15_s[:],
-                "a16": a16_s[:],
-            }
 
-            # guarantee at least 1 per cohort in each role
             soap = []
             rm = []
             tsr = []
 
-            for cohort_key, cohort_list in buckets.items():
-                if not cohort_list:
-                    continue
+            # ---- 1) A15 EXECUTOR LOGIC ----
+            if a15_s:
+                # sort by least used A15
+                ordered_a15 = sorted(a15_s, key=lambda x: a15_usage.get(x, 0))
 
-                # sort by lowest usage first (soft fairness)
-                ordered = sorted(cohort_list, key=lambda x: usage.get(x, 0))
+                if n == 1:
+                    # only 1 patient → 1 executor only
+                    exec1 = ordered_a15[0]
+                    soap.append(exec1)
+                    rm.append(exec1)
+                    tsr.append(exec1)
+                    a15_usage[exec1] += 1
 
-                # SOAP
-                s = ordered[0]
-                soap.append(s)
-                usage[s] = usage.get(s, 0) + 1
+                elif n == 2:
+                    # 2 patients → per patient 2 executors if possible
+                    exec1 = ordered_a15[0]
+                    exec2 = ordered_a15[1] if len(ordered_a15) > 1 else ordered_a15[0]
 
-                # RM/ERM (heavier)
-                r = ordered[1] if len(ordered) > 1 else ordered[0]
-                rm.append(r)
-                usage[r] = usage.get(r, 0) + 1
+                    soap.append(exec1)
+                    rm.append(exec1)
+                    tsr.append(exec2)
+                    rm.append(exec2)
 
-                # TSR
-                t = ordered[2] if len(ordered) > 2 else ordered[0]
-                tsr.append(t)
-                usage[t] = usage.get(t, 0) + 1
+                    a15_usage[exec1] += 1
+                    a15_usage[exec2] += 1
+
+                else:
+                    # 3+ patients → distribute A15 evenly, 1 executor per patient
+                    exec1 = ordered_a15[0]
+                    soap.append(exec1)
+                    rm.append(exec1)
+                    tsr.append(exec1)
+                    a15_usage[exec1] += 1
+
+            # ---- 2) REPRESENTATION PER COHORT ----
+            for cohort in [a12_s, a13_s, a14_s, a16_s]:
+                if cohort:
+                    soap.append(cohort[0])
+                    tsr.append(cohort[0])
+
+            # ---- 3) RM/ERM = SOAP ∪ TSR ----
+            rm = uniq(rm + soap + tsr)
 
             out["pre_op"].append({
                 "name": p["name"],

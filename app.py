@@ -570,37 +570,59 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
         if n == 1:
             p = pre_ops[0]
 
-            # A15 workload rule:
-            # 1 SOAP, 1 TSR, 2 RM/ERM
-            soap = []
-            tsr = []
-            rm = []
+            # Strict composition rule for 1 Pre Op:
+            # SOAP: 1 A12, 1 A13, 1 A14, 1 A15, 1 A16
+            # RM/ERM: 1 A12, 1 A13, 1 A14, 2 A15, 2 A16
+            # TSR: 1 A12, 1 A13, 1 A14, 2 A15, 2 A16
+            # All names must appear at least once.
 
-            if len(a15_r) >= 4:
-                soap_a15 = a15_r[0]
-                tsr_a15 = a15_r[1]
-                rm_a15_1 = a15_r[2]
-                rm_a15_2 = a15_r[3]
-            elif len(a15_r) >= 2:
-                soap_a15 = a15_r[0]
-                tsr_a15 = a15_r[1]
-                rm_a15_1 = a15_r[0]
-                rm_a15_2 = a15_r[1]
-            elif a15_r:
-                soap_a15 = tsr_a15 = rm_a15_1 = rm_a15_2 = a15_r[0]
-            else:
-                soap_a15 = tsr_a15 = rm_a15_1 = rm_a15_2 = None
+            def pick(pool, idx):
+                if not pool:
+                    return None
+                return pool[idx % len(pool)]
 
-            # Representatives from other cohorts (different indices to avoid same person everywhere)
-            soap += [pick_rot(a12_r, 0), pick_rot(a13_r, 0), pick_rot(a14_r, 0), soap_a15, pick_rot(a16_r, 0)]
-            tsr  += [pick_rot(a12_r, 1), pick_rot(a13_r, 1), pick_rot(a14_r, 1), tsr_a15, pick_rot(a16_r, 1)]
+            # --- SOAP ---
+            soap = [
+                pick(a12_r, 0),
+                pick(a13_r, 0),
+                pick(a14_r, 0),
+                pick(a15_r, 0),
+                pick(a16_r, 0),
+            ]
 
-            # RM/ERM must contain EVERYONE (so all names appear)
-            rm = uniq(a12_r + a13_r + a14_r + a15_r + a16_r)
+            # --- RM/ERM ---
+            rm = [
+                pick(a12_r, 1),
+                pick(a13_r, 1),
+                pick(a14_r, 1),
+                pick(a15_r, 1),
+                pick(a15_r, 2),
+                pick(a16_r, 1),
+                pick(a16_r, 2),
+            ]
 
+            # --- TSR ---
+            tsr = [
+                pick(a12_r, 0 if len(a12_r) == 1 else 1),
+                pick(a13_r, 0 if len(a13_r) == 1 else 1),
+                pick(a14_r, 0 if len(a14_r) == 1 else 1),
+                pick(a15_r, 2 if len(a15_r) > 2 else 0),
+                pick(a15_r, 3 if len(a15_r) > 3 else 1),
+                pick(a16_r, 2 if len(a16_r) > 2 else 0),
+                pick(a16_r, 3 if len(a16_r) > 3 else 1),
+            ]
+
+            # Remove None and duplicates inside each role
             soap = cohort_order(uniq([x for x in soap if x]))
+            rm = cohort_order(uniq([x for x in rm if x]))
             tsr = cohort_order(uniq([x for x in tsr if x]))
-            rm = cohort_order(rm)
+
+            # Ensure all names appear at least once (fallback into RM if missing)
+            everyone = set(a12_r + a13_r + a14_r + a15_r + a16_r)
+            appeared = set(soap + rm + tsr)
+            missing = everyone - appeared
+            if missing:
+                rm = cohort_order(uniq(rm + list(missing)))
 
             out["pre_op"].append({
                 "name": p["name"],

@@ -550,130 +550,88 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                 })
 
     # =========================
-    # PRE OP
+    # PRE OP (A15-centered executor logic, strict)
     # =========================
     if pre_ops:
         n = len(pre_ops)
 
-        # We allow overlaps across patients. Hard requirements:
-        # - Per patient, SOAP/TSR must include representation A12–A16 (if available).
-        # - RM/ERM is heavy and can include many people; we will also use it to ensure nobody is left out.
-        # - Fairness is soft; we try to rotate picks across patients using usage counters.
+        used_a15 = {x: 0 for x in a15_s}
+        per_patient = []
 
-        used_all = {}          # usage counter across ALL cohorts (soft fairness)
-        used_a15 = {}          # A15 extra weight tracking
-        for x in a15_s:
-            used_a15[x] = 0
+        def next_a15():
+            if not a15_s:
+                return None
+            ordered = sorted(a15_s, key=lambda x: (used_a15.get(x, 0), x.lower()))
+            chosen = ordered[0]
+            used_a15[chosen] += 1
+            return chosen
 
-        per_patient = []       # store dicts per patient before finalizing
-        covered = set()        # who already appears anywhere in PRE OP (any role, any patient)
-
-        def pick_one(pool: list[str], salt: str):
-            xs = pick_least_used(pool, 1, used_all, iso_date, salt)
-            return xs[0] if xs else None
-
-        def pick_one_excluding(pool: list[str], exclude: set, salt: str):
-            cand = [x for x in (pool or []) if x not in exclude]
-            x = pick_one(cand, salt)
-            if x:
-                return x
-            # fallback allow duplicates if needed
-            return pick_one(pool, salt)
-
-        # 1) Build SOAP/TSR cores per patient (representative + rotated)
         for i, p in enumerate(pre_ops):
+
+            # --- pick executor(s) from A15 ---
+            if not a15_s:
+                exec_soap = None
+                exec_tsr = None
+            elif n == 1:
+                # 1 patient → 1 executor handles all visible roles
+                exec_soap = next_a15()
+                exec_tsr = exec_soap
+            elif n == 2:
+                # 2 patients → 2 executors per patient if possible
+                exec_soap = next_a15()
+                exec_tsr = next_a15() if len(a15_s) > 1 else exec_soap
+            else:
+                # 3+ patients → 1 executor per patient, alternate role
+                exec_soap = next_a15()
+                exec_tsr = exec_soap
+
             soap = []
             tsr = []
             rm = []
 
-            # --- SOAP reps A12/A13/A14/A16 ---
-            for cohort_key, pool in [("a12", a12_s), ("a13", a13_s), ("a14", a14_s), ("a16", a16_s)]:
+            # --- ensure representation A12–A16 in SOAP ---
+            for pool in [a12_s, a13_s, a14_s, a16_s]:
                 if pool:
-                    x = pick_one_excluding(pool, set(soap), f"pre:{i}:{cohort_key}:soap")
-                    if x: soap.append(x)
+                    soap.append(pool[i % len(pool)])
 
-            # --- TSR reps A12/A13/A14/A16 (try different person than SOAP when possible) ---
-            for cohort_key, pool in [("a12", a12_s), ("a13", a13_s), ("a14", a14_s), ("a16", a16_s)]:
+            if exec_soap:
+                soap.append(exec_soap)
+
+            # --- ensure representation A12–A16 in TSR ---
+            for pool in [a12_s, a13_s, a14_s, a16_s]:
                 if pool:
-                    x = pick_one_excluding(pool, set(soap) | set(tsr), f"pre:{i}:{cohort_key}:tsr")
-                    if x: tsr.append(x)
+                    tsr.append(pool[(i + 1) % len(pool)])
 
-            # --- A15 executor logic (your final rules) ---
-            if a15_s:
-                # sort A15 by least-used (A15 fairness is primary)
-                ordered_a15 = sorted(a15_s, key=lambda x: (used_a15.get(x, 0), used_all.get(x, 0), x.lower()))
-
-                if n == 1:
-                    # 1 patient: everyone should still get some PRE OP task -> we'll add extras later via RM/ERM.
-                    exec1 = ordered_a15[0]
-                    # put exec in SOAP+TSR so A15 appears everywhere
-                    soap.append(exec1)
-                    tsr.append(exec1)
-                    used_a15[exec1] = used_a15.get(exec1, 0) + 1
-                    used_all[exec1] = used_all.get(exec1, 0) + 1
-
-                elif n == 2:
-                    # 2 patients: per patient 2 executors if possible (soap+rm) and (tsr+rm)
-                    exec_soap = ordered_a15[0]
-                    exec_tsr = ordered_a15[1] if len(ordered_a15) > 1 else ordered_a15[0]
-
-                    soap.append(exec_soap)
-                    tsr.append(exec_tsr)
-
-                    used_a15[exec_soap] = used_a15.get(exec_soap, 0) + 1
-                    used_all[exec_soap] = used_all.get(exec_soap, 0) + 1
-                    used_a15[exec_tsr] = used_a15.get(exec_tsr, 0) + 1
-                    used_all[exec_tsr] = used_all.get(exec_tsr, 0) + 1
-
-                else:
-                    # 3+ patients: distribute A15 as evenly as possible (1 primary executor per patient)
-                    exec1 = ordered_a15[0]
-                    # alternate whether executor goes to SOAP or TSR to spread visible work
-                    if i % 2 == 0:
-                        soap.append(exec1)
-                    else:
-                        tsr.append(exec1)
-                    used_a15[exec1] = used_a15.get(exec1, 0) + 1
-                    used_all[exec1] = used_all.get(exec1, 0) + 1
-
-            # Make sure SOAP/TSR are non-empty if any people exist
-            if not soap and all_people():
-                soap.append(all_people()[0])
-            if not tsr and all_people():
-                tsr.append(all_people()[0])
+            if exec_tsr:
+                tsr.append(exec_tsr)
 
             soap = cohort_order(uniq(soap))
             tsr = cohort_order(uniq(tsr))
 
-            # RM/ERM starts as union (your desired pattern)
-            rm = cohort_order(uniq(rm + soap + tsr))
+            # RM/ERM = union + guarantee all A15 appear at least somewhere
+            rm = cohort_order(uniq(soap + tsr))
 
-            per_patient.append({"name": p["name"], "soap": soap, "tsr": tsr, "rm_erm": rm})
-            covered.update(soap)
-            covered.update(tsr)
-            covered.update(rm)
+            per_patient.append({
+                "name": p["name"],
+                "soap": soap,
+                "tsr": tsr,
+                "rm_erm": rm
+            })
 
-        # 2) Ensure nobody is left out in PRE OP when PRE OP exists (soft rule).
-        # We add missing people into RM/ERM (heavy role) across patients, rotating by current RM size.
-        missing = [x for x in (a12_s + a13_s + a14_s + a15_s + a16_s) if x and x not in covered]
-        missing = uniq(missing)
+        # ensure all A15 appear in PRE OP at least once
+        appeared = set()
+        for pp in per_patient:
+            appeared.update(pp["soap"])
+            appeared.update(pp["tsr"])
+            appeared.update(pp["rm_erm"])
 
-        def pick_patient_for_extra():
-            # choose patient with smallest RM/ERM, tie-break by index
-            best_i = 0
-            best_len = 10**9
-            for i, pp in enumerate(per_patient):
-                l = len(pp.get("rm_erm") or [])
-                if l < best_len:
-                    best_len = l
-                    best_i = i
-            return best_i
+        missing_a15 = [x for x in a15_s if x not in appeared]
 
-        for x in missing:
-            j = pick_patient_for_extra()
-            per_patient[j]["rm_erm"] = cohort_order(uniq(per_patient[j]["rm_erm"] + [x]))
+        for x in missing_a15:
+            # inject into smallest RM/ERM bucket
+            smallest = min(per_patient, key=lambda pp: len(pp["rm_erm"]))
+            smallest["rm_erm"] = cohort_order(uniq(smallest["rm_erm"] + [x]))
 
-        # 3) Finalize output
         for pp in per_patient:
             out["pre_op"].append({
                 "name": pp["name"],

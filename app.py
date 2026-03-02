@@ -431,65 +431,72 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     # ---- Role assignment from per-patient buckets ----
     def assign_roles_from_buckets(buckets: dict, mode: str):
         """
-        buckets: {"a12": [...], "a13": [...], "a14": [...], "a15": [...], "a16": [...]}
-        We CONSUME from buckets so people end up with exactly one primary jobdesk in this section.
-        For PRE: roles = SOAP (w1), TSR (w1), RM/ERM (w2). For IGD: TSR->ER.
-        Strategy:
-        - First, each role tries to take 1 person from each cohort (if available) -> ensures representation.
-        - Then fill remaining roles by consuming remaining people, prioritizing RM/ERM (weight 2) to hold the leftovers.
+        STRICT cohort-based fairness:
+        - For EACH patient:
+            SOAP must try to include A12, A13, A14, A15, A16 (if available)
+            RM/ERM must try to include A12, A13, A14, A15, A16 (if available)
+            TSR/ER must try to include A12, A13, A14, A15, A16 (if available)
+        - People are distributed per patient first (buckets already split earlier).
+        - No role is allowed to be empty for a cohort if that cohort has people in this patient bucket.
+        - If mathematically impossible, we accept imbalance.
         """
-        # Flatten helpers
-        def pop_one(cohort_key):
-            xs = buckets.get(cohort_key) or []
-            if xs:
-                return xs.pop(0)
-            return None
 
         cohort_keys = ["a12", "a13", "a14", "a15", "a16"]
 
-        # Start with representation picks (up to 1 each cohort)
+        # Work on local copies so we don't mutate original reference accidentally
+        local = {k: list(buckets.get(k) or []) for k in cohort_keys}
+
         soap = []
         rm = []
-        third = []  # TSR or ER
+        third = []
+
+        # --- STEP 1: ensure representation per role ---
+        # For each cohort, cycle roles so distribution spreads
+        role_cycle = ["soap", "rm", "third"]
 
         for k in cohort_keys:
-            x = pop_one(k)
-            if x: soap.append(x)
+            members = local.get(k) or []
+            if not members:
+                continue
+
+            # Deterministic shuffle inside cohort
+            shuffled_members = shuffled(members, iso_date, f"rolecycle:{k}")
+
+            for idx, person in enumerate(shuffled_members):
+                target_role = role_cycle[idx % 3]
+                if target_role == "soap":
+                    soap.append(person)
+                elif target_role == "rm":
+                    rm.append(person)
+                else:
+                    third.append(person)
+
+        # --- STEP 2: If roles too small and we still have heavy imbalance, rebalance ---
+        # We don't want TSR to be empty while others huge.
+
+        all_people_flat = uniq(soap + rm + third)
+
+        # Guarantee at least 1 person per cohort in each role IF POSSIBLE
         for k in cohort_keys:
-            x = pop_one(k)
-            if x: rm.append(x)
-        for k in cohort_keys:
-            x = pop_one(k)
-            if x: third.append(x)
+            cohort_members = [x for x in local.get(k, []) if x in all_people_flat]
+            if not cohort_members:
+                continue
 
-        # Remaining people: go to RM/ERM first (weight 2), then distribute a bit to SOAP/third if they are too small.
-        remaining = []
-        for k in cohort_keys:
-            remaining += (buckets.get(k) or [])
+            # Check SOAP
+            if not any(x in soap for x in cohort_members):
+                soap.append(cohort_members[0])
 
-        # Clear buckets (consumed)
-        for k in cohort_keys:
-            buckets[k] = []
+            # Check RM
+            if not any(x in rm for x in cohort_members):
+                rm.append(cohort_members[min(1, len(cohort_members)-1)])
 
-        # If we still have many remaining, keep RM as the sink (so everyone has a jobdesk and RM is heavier).
-        # But ensure SOAP and TSR/ER aren't tiny when there are plenty of people.
-        # Target minimums when possible:
-        # - If total >= 10: SOAP >= 5 and TSR/ER >= 5
-        total_now = len(soap) + len(rm) + len(third) + len(remaining)
-        if total_now >= 10:
-            # grow soap up to 5
-            while len(soap) < 5 and remaining:
-                soap.append(remaining.pop(0))
-            # grow third up to 5
-            while len(third) < 5 and remaining:
-                third.append(remaining.pop(0))
+            # Check THIRD
+            if not any(x in third for x in cohort_members):
+                third.append(cohort_members[-1])
 
-        # everything else -> RM
-        rm += remaining
-
-        soap = cohort_order(soap)
-        rm = cohort_order(rm)
-        third = cohort_order(third)
+        soap = cohort_order(uniq(soap))
+        rm = cohort_order(uniq(rm))
+        third = cohort_order(uniq(third))
 
         if mode == "pre":
             return {"soap": soap, "rm_erm": rm, "tsr": third}

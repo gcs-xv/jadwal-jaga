@@ -7,7 +7,81 @@ import streamlit as st
 from datetime import datetime, date as dt_date
 from supabase import create_client
 
+
 st.set_page_config(page_title="Jadwal Jaga Residen", layout="wide")
+
+st.markdown("""
+<style>
+/* ---- playful but clean theme ---- */
+:root {
+  --p1: #7c3aed;   /* purple */
+  --p2: #ec4899;   /* pink */
+  --p3: #22c55e;   /* green */
+  --bg: #fff7ff;   /* soft */
+}
+.block-container { padding-top: 1.2rem; }
+
+.hero {
+  background: linear-gradient(135deg, #f3e8ff 0%, #ffe4f2 40%, #ecfeff 100%);
+  border-radius: 18px;
+  padding: 18px 18px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+  margin-bottom: 14px;
+}
+.hero-title {
+  font-size: 28px;
+  font-weight: 800;
+  color: #3b0764;
+  margin: 0;
+  line-height: 1.15;
+}
+.hero-sub {
+  margin-top: 6px;
+  color: rgba(60, 7, 100, 0.75);
+  font-weight: 600;
+}
+
+.card {
+  border-radius: 18px;
+  padding: 16px 16px 12px 16px;
+  box-shadow: 0 5px 16px rgba(0,0,0,0.08);
+  margin-bottom: 14px;
+  border: 1px solid rgba(124,58,237,0.12);
+  background: white;
+}
+
+.card.post { border-left: 8px solid var(--p2); }
+.card.pre  { border-left: 8px solid var(--p1); }
+.card.igd  { border-left: 8px solid var(--p3); }
+
+.card h3 {
+  margin: 0 0 10px 0;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.small-note {
+  font-size: 12px;
+  opacity: .85;
+  margin-top: 6px;
+}
+
+.stButton>button {
+  border-radius: 14px !important;
+  font-weight: 800 !important;
+  padding: .55rem .9rem !important;
+}
+
+input, textarea, .stSelectbox div[data-baseweb="select"] {
+  border-radius: 14px !important;
+}
+
+@media (max-width: 768px) {
+  .hero-title { font-size: 24px; }
+  .card { padding: 14px; }
+}
+</style>
+""", unsafe_allow_html=True)
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_ANON_KEY"]
@@ -482,7 +556,13 @@ def format_wa_text(assign: dict) -> str:
     return "".join(lines)
 
 # ---------- UI ----------
-st.title("📅 Jadwal Jaga Residen (Import CSV → Roster Lengkap)")
+st.markdown(
+    "<div class='hero'>"
+    "<div class='hero-title'>🌸 Jadwal Jaga Residen</div>"
+    "<div class='hero-sub'>Isi pasien tinggal klik tambah — tanpa tanda | dan tanpa ribet. Output siap copy ke WhatsApp.</div>"
+    "</div>",
+    unsafe_allow_html=True
+)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -526,33 +606,73 @@ with tab_use:
 
             c1, c2 = st.columns(2)
             with c1:
-                default_post = ""
-                default_pre = ""
-                default_igd = ""
-                if saved_payload:
-                    # reconstruct simple defaults from saved payload
-                    if saved_payload.get("post_op"):
-                        default_post = "\n".join([f"{p['name']} | {p['pod_lines'][0]['label']}" for p in saved_payload["post_op"]])
-                    if saved_payload.get("pre_op"):
-                        default_pre = "\n".join([p["name"] for p in saved_payload["pre_op"]])
-                    if saved_payload.get("igd"):
-                        default_igd = "\n".join([p["name"] for p in saved_payload["igd"]])
+                # Initialize session state rows
+                if "post_rows" not in st.session_state:
+                    st.session_state.post_rows = []
+                if "pre_rows" not in st.session_state:
+                    st.session_state.pre_rows = []
+                if "igd_rows" not in st.session_state:
+                    st.session_state.igd_rows = []
 
-                post_text = st.text_area(
-                    "POST OP (1 baris per pasien). Boleh: 'Nama | POD III' atau 'Nama | POD 0'",
-                    value=default_post,
-                    height=140
-                )
-                pre_text = st.text_area(
-                    "PRE OP (1 baris per pasien)",
-                    value=default_pre,
-                    height=140
-                )
-                igd_text = st.text_area(
-                    "IGD (1 baris per pasien)",
-                    value=default_igd,
-                    height=120
-                )
+                # If there is a saved payload and the UI is still empty, preload once
+                if saved_payload and not st.session_state.get("_ui_preloaded", False):
+                    st.session_state.post_rows = [
+                        {"name": p.get("name", ""), "pod": (p.get("pod_lines", [{}])[0].get("label", "POD 0").replace("POD ", "").strip() or "0")}
+                        for p in (saved_payload.get("post_op") or [])
+                    ]
+                    st.session_state.pre_rows = [{"name": p.get("name", "")} for p in (saved_payload.get("pre_op") or [])]
+                    st.session_state.igd_rows = [{"name": p.get("name", "")} for p in (saved_payload.get("igd") or [])]
+                    st.session_state._ui_preloaded = True
+
+                # ---- POST OP card ----
+                st.markdown("<div class='card post'><h3>🔴 POST OP</h3>", unsafe_allow_html=True)
+                st.caption("Klik tambah pasien. POD cukup pilih angka/romawi di dropdown. (Tidak perlu ketik '|' ya.)")
+
+                if st.button("➕ Tambah Post Op", key="btn_add_post"):
+                    st.session_state.post_rows.append({"name": "", "pod": "0"})
+
+                POD_OPTIONS = ["0", "I", "II", "III", "IV", "V", "VI", "VII"]
+                for i, row in enumerate(st.session_state.post_rows):
+                    r1, r2, r3 = st.columns([3, 2, 1])
+                    row["name"] = r1.text_input("Nama pasien", value=row.get("name", ""), key=f"post_name_{i}")
+                    row["pod"] = r2.selectbox("POD hari ini", POD_OPTIONS, index=POD_OPTIONS.index(row.get("pod","0")) if row.get("pod","0") in POD_OPTIONS else 0, key=f"post_pod_{i}")
+                    if r3.button("🗑️", key=f"post_del_{i}"):
+                        st.session_state.post_rows.pop(i)
+                        st.rerun()
+
+                st.markdown("<div class='small-note'>Tip: kalau pasien POST OP cuma 1, sistem otomatis bagi semua orang jadi 2 tim (POD n dan POD n+1) supaya tidak ada yang nganggur.</div></div>", unsafe_allow_html=True)
+
+                # ---- PRE OP card ----
+                st.markdown("<div class='card pre'><h3>🟣 PRE OP</h3>", unsafe_allow_html=True)
+                st.caption("Isi nama pasien saja. Pembagian SOAP/RM/ERM/TSR dibuat otomatis dan fair.")
+
+                if st.button("➕ Tambah Pre Op", key="btn_add_pre"):
+                    st.session_state.pre_rows.append({"name": ""})
+
+                for i, row in enumerate(st.session_state.pre_rows):
+                    r1, r2 = st.columns([5, 1])
+                    row["name"] = r1.text_input("Nama pasien", value=row.get("name", ""), key=f"pre_name_{i}")
+                    if r2.button("🗑️", key=f"pre_del_{i}"):
+                        st.session_state.pre_rows.pop(i)
+                        st.rerun()
+
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                # ---- IGD card ----
+                st.markdown("<div class='card igd'><h3>🟢 IGD</h3>", unsafe_allow_html=True)
+                st.caption("Isi nama pasien saja. Untuk IGD, TSR diganti ER.")
+
+                if st.button("➕ Tambah IGD", key="btn_add_igd"):
+                    st.session_state.igd_rows.append({"name": ""})
+
+                for i, row in enumerate(st.session_state.igd_rows):
+                    r1, r2 = st.columns([5, 1])
+                    row["name"] = r1.text_input("Nama pasien", value=row.get("name", ""), key=f"igd_name_{i}")
+                    if r2.button("🗑️", key=f"igd_del_{i}"):
+                        st.session_state.igd_rows.pop(i)
+                        st.rerun()
+
+                st.markdown("</div>", unsafe_allow_html=True)
 
             with c2:
                 default_erm = saved_payload.get("erm_manual","") if saved_payload else ""
@@ -561,10 +681,11 @@ with tab_use:
                 review_manual = st.text_input("Review (manual)", value=default_rev)
 
                 st.caption("Catatan: pairing A14/A15 dibuat otomatis dan konsisten per tanggal (acak tapi deterministik). A16 ikut masuk pembagian dan selalu ditaruh paling belakang.")
+                st.caption("✨ Output WA akan muncul di bawah setelah Generate. Kamu tinggal copy-paste.")
 
-            post_ops = parse_patients_lines(post_text)
-            pre_ops = parse_patients_lines(pre_text)
-            igds = parse_patients_lines(igd_text)
+            post_ops = [{"name": x.get("name","").strip(), "meta": f"POD {x.get('pod','0')}".strip()} for x in (st.session_state.get("post_rows") or []) if (x.get("name") or "").strip()]
+            pre_ops = [{"name": x.get("name","").strip(), "meta": ""} for x in (st.session_state.get("pre_rows") or []) if (x.get("name") or "").strip()]
+            igds = [{"name": x.get("name","").strip(), "meta": ""} for x in (st.session_state.get("igd_rows") or []) if (x.get("name") or "").strip()]
 
             if st.button("Generate Pembagian"):
                 assign = build_assignment(

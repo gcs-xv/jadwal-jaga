@@ -431,72 +431,66 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     # ---- Role assignment from per-patient buckets ----
     def assign_roles_from_buckets(buckets: dict, mode: str):
         """
-        STRICT cohort-based fairness:
-        - For EACH patient:
-            SOAP must try to include A12, A13, A14, A15, A16 (if available)
-            RM/ERM must try to include A12, A13, A14, A15, A16 (if available)
-            TSR/ER must try to include A12, A13, A14, A15, A16 (if available)
-        - People are distributed per patient first (buckets already split earlier).
-        - No role is allowed to be empty for a cohort if that cohort has people in this patient bucket.
-        - If mathematically impossible, we accept imbalance.
+        PRE/IGD logic (revised):
+        - Each patient keeps its own cohort buckets (already split earlier).
+        - SOAP = small core team (1 per cohort if possible).
+        - RM/ERM = heavy team (can overlap with SOAP, especially A15 as executor).
+        - TSR/ER = lighter team (can overlap with RM/ERM).
+        - Overlap is allowed and intentional.
+        - Output always ordered A12 → A13 → A14 → A15 → A16.
         """
 
         cohort_keys = ["a12", "a13", "a14", "a15", "a16"]
 
-        # Work on local copies so we don't mutate original reference accidentally
+        # local copy
         local = {k: list(buckets.get(k) or []) for k in cohort_keys}
 
         soap = []
         rm = []
         third = []
 
-        # --- STEP 1: ensure representation per role ---
-        # For each cohort, cycle roles so distribution spreads
-        role_cycle = ["soap", "rm", "third"]
+        # STEP 1 — SOAP: pick 1 per cohort if possible
+        for k in cohort_keys:
+            members = local.get(k) or []
+            if members:
+                soap.append(members[0])
 
+        # STEP 2 — RM/ERM: heavier role
+        # Prefer A15 executors + allow overlap with SOAP
         for k in cohort_keys:
             members = local.get(k) or []
             if not members:
                 continue
 
-            # Deterministic shuffle inside cohort
-            shuffled_members = shuffled(members, iso_date, f"rolecycle:{k}")
+            if k == "a15":
+                # A15 main executors → include all of them
+                rm.extend(members)
+            else:
+                # include first member at minimum
+                rm.append(members[0])
+                # if more than 1 member in cohort, include second for load sharing
+                if len(members) > 1:
+                    rm.append(members[1])
 
-            for idx, person in enumerate(shuffled_members):
-                target_role = role_cycle[idx % 3]
-                if target_role == "soap":
-                    soap.append(person)
-                elif target_role == "rm":
-                    rm.append(person)
-                else:
-                    third.append(person)
-
-        # --- STEP 2: If roles too small and we still have heavy imbalance, rebalance ---
-        # We don't want TSR to be empty while others huge.
-
-        all_people_flat = uniq(soap + rm + third)
-
-        # Guarantee at least 1 person per cohort in each role IF POSSIBLE
+        # STEP 3 — TSR / ER: lighter but still representative
         for k in cohort_keys:
-            cohort_members = [x for x in local.get(k, []) if x in all_people_flat]
-            if not cohort_members:
+            members = local.get(k) or []
+            if not members:
                 continue
 
-            # Check SOAP
-            if not any(x in soap for x in cohort_members):
-                soap.append(cohort_members[0])
+            if len(members) > 1:
+                third.append(members[-1])
+            else:
+                third.append(members[0])
 
-            # Check RM
-            if not any(x in rm for x in cohort_members):
-                rm.append(cohort_members[min(1, len(cohort_members)-1)])
+        # remove duplicates but KEEP overlap between roles
+        soap = uniq(soap)
+        rm = uniq(rm)
+        third = uniq(third)
 
-            # Check THIRD
-            if not any(x in third for x in cohort_members):
-                third.append(cohort_members[-1])
-
-        soap = cohort_order(uniq(soap))
-        rm = cohort_order(uniq(rm))
-        third = cohort_order(uniq(third))
+        soap = cohort_order(soap)
+        rm = cohort_order(rm)
+        third = cohort_order(third)
 
         if mode == "pre":
             return {"soap": soap, "rm_erm": rm, "tsr": third}

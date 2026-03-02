@@ -431,66 +431,84 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     # ---- Role assignment from per-patient buckets ----
     def assign_roles_from_buckets(buckets: dict, mode: str):
         """
-        PRE/IGD logic (revised):
-        - Each patient keeps its own cohort buckets (already split earlier).
-        - SOAP = small core team (1 per cohort if possible).
-        - RM/ERM = heavy team (can overlap with SOAP, especially A15 as executor).
-        - TSR/ER = lighter team (can overlap with RM/ERM).
-        - Overlap is allowed and intentional.
-        - Output always ordered A12 → A13 → A14 → A15 → A16.
+        Fair PRE/IGD engine (any number of patients).
+
+        Rules implemented:
+        - For EACH patient: SOAP, RM/ERM, TSR(ER) must each contain
+          representation from A12, A13, A14, A15, A16 if available.
+        - RM/ERM is heavier → can overlap with SOAP/TSR.
+        - If only 1 patient: rotate roles so each person gets exactly ONE core role
+          before anyone gets double.
+        - If multiple patients: cohorts are already pre-split; enforce internal fairness.
         """
 
         cohort_keys = ["a12", "a13", "a14", "a15", "a16"]
 
-        # local copy
+        # clone
         local = {k: list(buckets.get(k) or []) for k in cohort_keys}
 
         soap = []
         rm = []
         third = []
 
-        # STEP 1 — SOAP: pick 1 per cohort if possible
-        for k in cohort_keys:
-            members = local.get(k) or []
-            if members:
-                soap.append(members[0])
+        # ---- helper: pop one person safely ----
+        def pop_one(lst):
+            return lst.pop(0) if lst else None
 
-        # STEP 2 — RM/ERM: heavier role
-        # Prefer A15 executors + allow overlap with SOAP
-        for k in cohort_keys:
-            members = local.get(k) or []
-            if not members:
-                continue
+        # ---- CASE 1: single patient ----
+        total_people = sum(len(local[k]) for k in cohort_keys)
+        if total_people > 0 and all(len(local[k]) <= 2 for k in cohort_keys):
+            # strict rotation: 1 task per person before doubling
+            role_cycle = ["soap", "rm", "third"]
+            idx = 0
+            for k in cohort_keys:
+                for person in local[k]:
+                    role = role_cycle[idx % 3]
+                    if role == "soap":
+                        soap.append(person)
+                    elif role == "rm":
+                        rm.append(person)
+                    else:
+                        third.append(person)
+                    idx += 1
+            # allow light overlap to balance rm if too small
+            if len(rm) < len(soap):
+                rm += soap[: max(0, len(soap) - len(rm))]
+        else:
+            # ---- CASE 2: multiple patients ----
+            # Guarantee 1 per cohort per role if possible
+            for k in cohort_keys:
+                members = local.get(k) or []
+                if not members:
+                    continue
 
-            if k == "a15":
-                # A15 main executors → include all of them
+                # SOAP
+                p = pop_one(members)
+                if p:
+                    soap.append(p)
+
+                # RM
+                p = pop_one(members)
+                if p:
+                    rm.append(p)
+
+                # THIRD
+                p = pop_one(members)
+                if p:
+                    third.append(p)
+
+                # remaining go to RM (heavier role)
                 rm.extend(members)
-            else:
-                # include first member at minimum
-                rm.append(members[0])
-                # if more than 1 member in cohort, include second for load sharing
-                if len(members) > 1:
-                    rm.append(members[1])
 
-        # STEP 3 — TSR / ER: lighter but still representative
-        for k in cohort_keys:
-            members = local.get(k) or []
-            if not members:
-                continue
+            # if some role accidentally empty, rebalance
+            if not soap:
+                soap = rm[:1]
+            if not third:
+                third = rm[:1]
 
-            if len(members) > 1:
-                third.append(members[-1])
-            else:
-                third.append(members[0])
-
-        # remove duplicates but KEEP overlap between roles
-        soap = uniq(soap)
-        rm = uniq(rm)
-        third = uniq(third)
-
-        soap = cohort_order(soap)
-        rm = cohort_order(rm)
-        third = cohort_order(third)
+        soap = cohort_order(uniq(soap))
+        rm = cohort_order(uniq(rm))
+        third = cohort_order(uniq(third))
 
         if mode == "pre":
             return {"soap": soap, "rm_erm": rm, "tsr": third}

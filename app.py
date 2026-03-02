@@ -261,23 +261,88 @@ def pick_least_used(pool: list[str], k: int, used: dict, iso_date: str, salt: st
 
 def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list, igds: list,
                      erm_manual: str, review_manual: str):
-    # Pools
+    # Cohort pools
     a12 = roster.get("a12") or []
     a13 = roster.get("a13") or []
     a14 = roster.get("a14") or []
     a15 = roster.get("a15") or []
-    a16 = roster.get("observers") or []  # angkatan 16 now included officially
+    a16 = roster.get("observers") or []  # angkatan 16 now participates (no separate observer section)
 
-    # Master pool for work assignment (pre-op/igd) includes everyone on duty (12-16)
-    pool_work = uniq(shuffled(a12, iso_date, "w:a12") + shuffled(a13, iso_date, "w:a13") +
-                     shuffled(a14, iso_date, "w:a14") + shuffled(a15, iso_date, "w:a15") +
-                     shuffled(a16, iso_date, "w:a16"))
+    # Deterministic shuffle per date (so re-generate same date => same pairing/rotation)
+    a12_s = shuffled(a12, iso_date, "rot:a12")
+    a13_s = shuffled(a13, iso_date, "rot:a13")
+    a14_s = shuffled(a14, iso_date, "rot:a14")
+    a15_s = shuffled(a15, iso_date, "rot:a15")
+    a16_s = shuffled(a16, iso_date, "rot:a16")
 
-    # Post-op pool also includes everyone, but fairness tracked separately
-    pool_post = pool_work[:]
+    def make_pairs(xs: list[str]) -> list[list[str]]:
+        pairs = []
+        i = 0
+        while i < len(xs):
+            if i + 1 < len(xs):
+                pairs.append([xs[i], xs[i+1]])
+                i += 2
+            else:
+                pairs.append([xs[i]])
+                i += 1
+        return pairs
 
-    used_work = {p: 0 for p in pool_work}
-    used_post = {p: 0 for p in pool_post}
+    a14_pairs = make_pairs(a14_s)
+    a15_pairs = make_pairs(a15_s)
+
+    # Simple rotators (deterministic because inputs are shuffled deterministically)
+    class Rot:
+        def __init__(self, items):
+            self.items = items[:] if items else []
+            self.i = 0
+        def next(self):
+            if not self.items:
+                return None
+            v = self.items[self.i % len(self.items)]
+            self.i += 1
+            return v
+
+    r12 = Rot(a12_s)
+    r13 = Rot(a13_s)
+    r14 = Rot(a14_pairs)
+    r15 = Rot(a15_pairs)
+    r16 = Rot(a16_s)
+
+    def core_team_12_15():
+        """
+        Core team for a patient:
+        A12 (1) + A13 (1) + A14 pair (up to 2) + A15 pair (up to 2)
+        Ordered: A12, A13, A14..., A15...
+        Target size is 6 if available.
+        """
+        t = []
+        x12 = r12.next()
+        x13 = r13.next()
+        p14 = r14.next() or []
+        p15 = r15.next() or []
+
+        if x12:
+            t.append(x12)
+        if x13:
+            t.append(x13)
+        t += [x for x in p14 if x]
+        t += [x for x in p15 if x]
+        return uniq(t)
+
+    def attach_a16_last(team: list[str], want: bool = True) -> list[str]:
+        if not want:
+            return team
+        x16 = r16.next()
+        if not x16:
+            return team
+        # Always place A16 at the end (after A15)
+        if x16 in team:
+            return team
+        return team + [x16]
+
+    def pick_first_n(team: list[str], n: int) -> list[str]:
+        n = max(1, n)
+        return team[: min(n, len(team))]
 
     out = {
         "date": iso_date,
@@ -291,72 +356,83 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
         "igd": [],
     }
 
-    # ---- PRE OP (work-heavy): try to give everyone a work role if pre/igd exists ----
-    # Role sizes (adapt down if pool is smaller)
-    def k4():
-        return min(4, max(1, len(pool_work)))
-    def k6():
-        return min(6, max(1, len(pool_work)))
-    def k3():
-        return min(3, max(1, len(pool_work)))
-
-    # PRE OP patients
+    # ---------- PRE OP (work-heavy) ----------
+    # Strategy:
+    # - RM/ERM uses core team (6-ish from A12-15)
+    # - SOAP and TSR use 4 names, with A16 rotated in as the LAST name (if available)
     for idx, p in enumerate(pre_ops, start=1):
-        soap = pick_least_used(pool_work, k4(), used_work, iso_date, f"pre{idx}:soap")
-        rm_erm = pick_least_used(pool_work, k6(), used_work, iso_date, f"pre{idx}:rm")
-        tsr = pick_least_used(pool_work, k4(), used_work, iso_date, f"pre{idx}:tsr")
+        core = core_team_12_15()
+        rm_erm = core
+
+        soap = pick_first_n(core, 3)
+        soap = attach_a16_last(soap, want=True)  # include A16 when possible
+        if len(soap) < 4:
+            soap = pick_first_n(core, 4)
+
+        tsr = pick_first_n(core[1:] + core[:1], 3)  # slight rotation vs SOAP
+        tsr = attach_a16_last(tsr, want=True)
+        if len(tsr) < 4:
+            tsr = pick_first_n(core, 4)
 
         out["pre_op"].append({
             "name": p["name"],
-            "soap": soap,
-            "rm_erm": rm_erm,
-            "tsr": tsr,
+            "soap": uniq(soap),
+            "rm_erm": uniq(rm_erm),
+            "tsr": uniq(tsr),
         })
 
-    # IGD patients
+    # ---------- IGD ----------
+    # Strategy:
+    # - RM/ERM uses core team
+    # - SOAP uses 4, with A16 last if available
+    # - ER uses 3, with A16 last if available
     for idx, p in enumerate(igds, start=1):
-        soap = pick_least_used(pool_work, k4(), used_work, iso_date, f"igd{idx}:soap")
-        rm_erm = pick_least_used(pool_work, k6(), used_work, iso_date, f"igd{idx}:rm")
-        er = pick_least_used(pool_work, k3(), used_work, iso_date, f"igd{idx}:er")
+        core = core_team_12_15()
+        rm_erm = core
+
+        soap = pick_first_n(core, 3)
+        soap = attach_a16_last(soap, want=True)
+        if len(soap) < 4:
+            soap = pick_first_n(core, 4)
+
+        er = pick_first_n([x for x in core if x], 2)
+        er = attach_a16_last(er, want=True)
+        if len(er) < 3:
+            er = pick_first_n(core, 3)
 
         out["igd"].append({
             "name": p["name"],
-            "soap": soap,
-            "rm_erm": rm_erm,
-            "er": er,
+            "soap": uniq(soap),
+            "rm_erm": uniq(rm_erm),
+            "er": uniq(er),
         })
 
-    # ---- POST OP (visit): fairness separate from PRE/IGD ----
-    def post_team_size():
-        return min(6, max(1, len(pool_post)))
-
+    # ---------- POST OP (visit) ----------
+    # Rule:
+    # - If ONLY 1 post-op patient: split POD lines into 2 different teams (team1/team2)
+    # - If 2+ post-op patients: SAME team for both POD lines per patient
     total_post = len(post_ops)
 
     for idx, p in enumerate(post_ops, start=1):
         labels = normalize_pod_label(p.get("meta", "")) or ("POD I", "POD II")
 
-        # If ONLY 1 post-op patient → split into 2 different teams
         if total_post == 1:
-            team1 = pick_least_used(pool_post, post_team_size(), used_post, iso_date, f"post{idx}:team1")
-            team2 = pick_least_used(pool_post, post_team_size(), used_post, iso_date, f"post{idx}:team2")
-
+            team1 = core_team_12_15()
+            team2 = core_team_12_15()
             out["post_op"].append({
                 "name": p["name"],
                 "pod_lines": [
-                    {"label": labels[0], "team": team1},
-                    {"label": labels[1], "team": team2},
+                    {"label": labels[0], "team": uniq(team1)},
+                    {"label": labels[1], "team": uniq(team2)},
                 ]
             })
-
-        # If 2 or more post-op patients → same team for POD n and POD n+1
         else:
-            team = pick_least_used(pool_post, post_team_size(), used_post, iso_date, f"post{idx}:team")
-
+            team = core_team_12_15()
             out["post_op"].append({
                 "name": p["name"],
                 "pod_lines": [
-                    {"label": labels[0], "team": team},
-                    {"label": labels[1], "team": team},
+                    {"label": labels[0], "team": uniq(team)},
+                    {"label": labels[1], "team": uniq(team)},
                 ]
             })
 
@@ -485,7 +561,7 @@ with tab_use:
                 erm_manual = st.text_input("ERM (manual)", value=default_erm)
                 review_manual = st.text_input("Review (manual)", value=default_rev)
 
-                st.caption("Catatan: aturan pairing A14/A15 pada MVP ini dibuat otomatis (urut alfabet).")
+                st.caption("Catatan: pairing A14/A15 dibuat otomatis dan konsisten per tanggal (acak tapi deterministik). A16 ikut masuk pembagian dan selalu ditaruh paling belakang.")
 
             post_ops = parse_patients_lines(post_text)
             pre_ops = parse_patients_lines(pre_text)

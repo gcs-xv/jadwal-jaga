@@ -554,56 +554,96 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     # =========================
     if pre_ops:
         n = len(pre_ops)
-        # Distribute cohorts across PRE patients (so A15/A16 are split, not dumped into RM only)
-        t12 = split_even_people(a12_s, n, "pre:a12")
-        t13 = split_even_people(a13_s, n, "pre:a13")
-        t14 = split_even_pairs(a14_pairs, n, "pre:a14pairs")
-        t15 = split_even_pairs(a15_pairs, n, "pre:a15pairs")
-        t16 = split_even_people(a16_s, n, "pre:a16")
+
+        # global usage tracker (fairness soft control)
+        usage = {}
 
         for idx, p in enumerate(pre_ops, start=1):
-            i = idx - 1
+            # For EACH patient, start from FULL cohort pools
             buckets = {
-                "a12": (t12[i] if t12 else [])[:],
-                "a13": (t13[i] if t13 else [])[:],
-                "a14": (t14[i] if t14 else [])[:],
-                "a15": (t15[i] if t15 else [])[:],
-                "a16": (t16[i] if t16 else [])[:],
+                "a12": a12_s[:],
+                "a13": a13_s[:],
+                "a14": a14_s[:],
+                "a15": a15_s[:],
+                "a16": a16_s[:],
             }
-            roles = assign_roles_from_buckets(buckets, mode="pre")
+
+            # guarantee at least 1 per cohort in each role
+            soap = []
+            rm = []
+            tsr = []
+
+            for cohort_key, cohort_list in buckets.items():
+                if not cohort_list:
+                    continue
+
+                # sort by lowest usage first (soft fairness)
+                ordered = sorted(cohort_list, key=lambda x: usage.get(x, 0))
+
+                # SOAP
+                s = ordered[0]
+                soap.append(s)
+                usage[s] = usage.get(s, 0) + 1
+
+                # RM/ERM (heavier)
+                r = ordered[1] if len(ordered) > 1 else ordered[0]
+                rm.append(r)
+                usage[r] = usage.get(r, 0) + 1
+
+                # TSR
+                t = ordered[2] if len(ordered) > 2 else ordered[0]
+                tsr.append(t)
+                usage[t] = usage.get(t, 0) + 1
+
             out["pre_op"].append({
                 "name": p["name"],
-                "soap": roles["soap"],
-                "rm_erm": roles["rm_erm"],
-                "tsr": roles["tsr"],
+                "soap": cohort_order(uniq(soap)),
+                "rm_erm": cohort_order(uniq(rm)),
+                "tsr": cohort_order(uniq(tsr)),
             })
 
     # =========================
     # IGD
     # =========================
     if igds:
-        n = len(igds)
-        t12 = split_even_people(a12_s, n, "igd:a12")
-        t13 = split_even_people(a13_s, n, "igd:a13")
-        t14 = split_even_pairs(a14_pairs, n, "igd:a14pairs")
-        t15 = split_even_pairs(a15_pairs, n, "igd:a15pairs")
-        t16 = split_even_people(a16_s, n, "igd:a16")
+        usage = {}
 
         for idx, p in enumerate(igds, start=1):
-            i = idx - 1
             buckets = {
-                "a12": (t12[i] if t12 else [])[:],
-                "a13": (t13[i] if t13 else [])[:],
-                "a14": (t14[i] if t14 else [])[:],
-                "a15": (t15[i] if t15 else [])[:],
-                "a16": (t16[i] if t16 else [])[:],
+                "a12": a12_s[:],
+                "a13": a13_s[:],
+                "a14": a14_s[:],
+                "a15": a15_s[:],
+                "a16": a16_s[:],
             }
-            roles = assign_roles_from_buckets(buckets, mode="igd")
+
+            soap = []
+            rm = []
+            er = []
+
+            for cohort_key, cohort_list in buckets.items():
+                if not cohort_list:
+                    continue
+
+                ordered = sorted(cohort_list, key=lambda x: usage.get(x, 0))
+
+                s = ordered[0]
+                soap.append(s)
+                usage[s] = usage.get(s, 0) + 1
+
+                r = ordered[1] if len(ordered) > 1 else ordered[0]
+                rm.append(r)
+                usage[r] = usage.get(r, 0) + 1
+
+                e = ordered[2] if len(ordered) > 2 else ordered[0]
+                er.append(e)
+                usage[e] = usage.get(e, 0) + 1
+
             out["igd"].append({
                 "name": p["name"],
-                "soap": roles["soap"],
-                "rm_erm": roles["rm_erm"],
-                "er": roles["er"],
+                "soap": cohort_order(uniq(soap)),
+                "rm_erm": cohort_order(uniq(rm)),
+                "er": cohort_order(uniq(er)),
             })
 
     return out

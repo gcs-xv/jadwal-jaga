@@ -2,6 +2,7 @@ import re
 import csv
 import io
 import json
+import random
 import streamlit as st
 from datetime import datetime, date as dt_date
 from supabase import create_client
@@ -215,33 +216,6 @@ def normalize_pod_label(meta: str):
     nxt_i = cur_i + 1
     return (f"POD {int_to_roman(cur_i)}", f"POD {int_to_roman(nxt_i)}")
 
-def pair_up(names: list[str]):
-    names = [n.strip() for n in (names or []) if n and n.strip()]
-    # deterministic pairing: sort then pair adjacent
-    names_sorted = sorted(names, key=lambda x: x.lower())
-    pairs = []
-    i = 0
-    while i < len(names_sorted):
-        if i + 1 < len(names_sorted):
-            pairs.append([names_sorted[i], names_sorted[i+1]])
-            i += 2
-        else:
-            pairs.append([names_sorted[i]])
-            i += 1
-    return pairs
-
-class Rotator:
-    def __init__(self, items: list):
-        self.items = items[:] if items else []
-        self.idx = 0
-
-    def next(self):
-        if not self.items:
-            return None
-        item = self.items[self.idx % len(self.items)]
-        self.idx += 1
-        return item
-
 def uniq(seq):
     seen = set()
     out = []
@@ -253,49 +227,63 @@ def uniq(seq):
             out.append(x)
     return out
 
+def seeded_rng(iso_date: str, salt: str = ""):
+    # deterministic RNG per date (so regenerate same date => same output)
+    seed = f"{iso_date}:{salt}"
+    return random.Random(seed)
+
+def shuffled(names: list[str], iso_date: str, salt: str):
+    rng = seeded_rng(iso_date, salt)
+    xs = [n.strip() for n in (names or []) if n and n.strip()]
+    rng.shuffle(xs)
+    return xs
+
+def pick_least_used(pool: list[str], k: int, used: dict, iso_date: str, salt: str):
+    """
+    Pick k distinct people from pool, prioritizing those with the lowest usage count.
+    Deterministic tie-break using a seeded shuffle.
+    """
+    if not pool or k <= 0:
+        return []
+    # tie-break order
+    order = shuffled(pool, iso_date, salt + ":tiebreak")
+    ordered = sorted(order, key=lambda x: (used.get(x, 0), x.lower()))
+    chosen = []
+    for x in ordered:
+        if x in chosen:
+            continue
+        chosen.append(x)
+        if len(chosen) >= k:
+            break
+    for x in chosen:
+        used[x] = used.get(x, 0) + 1
+    return chosen
+
 def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list, igds: list,
                      erm_manual: str, review_manual: str):
+    # Pools
     a12 = roster.get("a12") or []
     a13 = roster.get("a13") or []
     a14 = roster.get("a14") or []
     a15 = roster.get("a15") or []
-    observers = roster.get("observers") or []
+    a16 = roster.get("observers") or []  # angkatan 16 now included officially
 
-    a14_pairs = pair_up(a14)
-    a15_pairs = pair_up(a15)
+    # Master pool for work assignment (pre-op/igd) includes everyone on duty (12-16)
+    pool_work = uniq(shuffled(a12, iso_date, "w:a12") + shuffled(a13, iso_date, "w:a13") +
+                     shuffled(a14, iso_date, "w:a14") + shuffled(a15, iso_date, "w:a15") +
+                     shuffled(a16, iso_date, "w:a16"))
 
-    r12 = Rotator(a12)
-    r13 = Rotator(a13)
-    r14 = Rotator(a14_pairs)
-    r15 = Rotator(a15_pairs)
+    # Post-op pool also includes everyone, but fairness tracked separately
+    pool_post = pool_work[:]
 
-    def core_team():
-        lead12 = r12.next()
-        one13 = r13.next()
-        p14 = r14.next() or []
-        p15 = r15.next() or []
-        # core: 1 from 12, 1 from 13, 2 from 14, 2 from 15 (if available)
-        team = [lead12, one13] + list(p14) + list(p15)
-        return uniq([t for t in team if t])
-
-    def small_team(include12=True):
-        lead12 = r12.next() if include12 else None
-        one13 = r13.next()
-        p14 = r14.next() or []
-        p15 = r15.next() or []
-        team = [lead12, one13]
-        if p14:
-            team.append(p14[0])
-        if p15:
-            team.append(p15[0])
-        return uniq([t for t in team if t])
+    used_work = {p: 0 for p in pool_work}
+    used_post = {p: 0 for p in pool_post}
 
     out = {
         "date": iso_date,
         "day_name": iso_to_dayname(iso_date),
         "pilot": roster.get("pilot", ""),
         "copilot": roster.get("copilot", ""),
-        "observer": observers,
         "erm_manual": erm_manual or "",
         "review_manual": review_manual or "",
         "post_op": [],
@@ -303,42 +291,74 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
         "igd": [],
     }
 
-    # POST OP: each patient gets two POD lines (current and next)
-    for p in post_ops:
-        labels = normalize_pod_label(p.get("meta", "")) or ("POD I", "POD II")
-        t1 = core_team()
-        t2 = core_team()
-        out["post_op"].append({
-            "name": p["name"],
-            "pod_lines": [
-                {"label": labels[0], "team": t1},
-                {"label": labels[1], "team": t2},
-            ]
-        })
+    # ---- PRE OP (work-heavy): try to give everyone a work role if pre/igd exists ----
+    # Role sizes (adapt down if pool is smaller)
+    def k4():
+        return min(4, max(1, len(pool_work)))
+    def k6():
+        return min(6, max(1, len(pool_work)))
+    def k3():
+        return min(3, max(1, len(pool_work)))
 
-    # PRE OP: SOAP, RM/ERM, TSR
-    for p in pre_ops:
-        t_core = core_team()
-        soap = small_team(include12=True)
-        tsr = small_team(include12=True)
+    # PRE OP patients
+    for idx, p in enumerate(pre_ops, start=1):
+        soap = pick_least_used(pool_work, k4(), used_work, iso_date, f"pre{idx}:soap")
+        rm_erm = pick_least_used(pool_work, k6(), used_work, iso_date, f"pre{idx}:rm")
+        tsr = pick_least_used(pool_work, k4(), used_work, iso_date, f"pre{idx}:tsr")
+
         out["pre_op"].append({
             "name": p["name"],
             "soap": soap,
-            "rm_erm": t_core,
+            "rm_erm": rm_erm,
             "tsr": tsr,
         })
 
-    # IGD: SOAP, RM/ERM, ER
-    for p in igds:
-        t_core = core_team()
-        soap = small_team(include12=True)
-        er = small_team(include12=False)
+    # IGD patients
+    for idx, p in enumerate(igds, start=1):
+        soap = pick_least_used(pool_work, k4(), used_work, iso_date, f"igd{idx}:soap")
+        rm_erm = pick_least_used(pool_work, k6(), used_work, iso_date, f"igd{idx}:rm")
+        er = pick_least_used(pool_work, k3(), used_work, iso_date, f"igd{idx}:er")
+
         out["igd"].append({
             "name": p["name"],
             "soap": soap,
-            "rm_erm": t_core,
+            "rm_erm": rm_erm,
             "er": er,
         })
+
+    # ---- POST OP (visit): fairness separate from PRE/IGD ----
+    def post_team_size():
+        return min(6, max(1, len(pool_post)))
+
+    total_post = len(post_ops)
+
+    for idx, p in enumerate(post_ops, start=1):
+        labels = normalize_pod_label(p.get("meta", "")) or ("POD I", "POD II")
+
+        # If ONLY 1 post-op patient → split into 2 different teams
+        if total_post == 1:
+            team1 = pick_least_used(pool_post, post_team_size(), used_post, iso_date, f"post{idx}:team1")
+            team2 = pick_least_used(pool_post, post_team_size(), used_post, iso_date, f"post{idx}:team2")
+
+            out["post_op"].append({
+                "name": p["name"],
+                "pod_lines": [
+                    {"label": labels[0], "team": team1},
+                    {"label": labels[1], "team": team2},
+                ]
+            })
+
+        # If 2 or more post-op patients → same team for POD n and POD n+1
+        else:
+            team = pick_least_used(pool_post, post_team_size(), used_post, iso_date, f"post{idx}:team")
+
+            out["post_op"].append({
+                "name": p["name"],
+                "pod_lines": [
+                    {"label": labels[0], "team": team},
+                    {"label": labels[1], "team": team},
+                ]
+            })
 
     return out
 
@@ -354,7 +374,7 @@ def format_wa_text(assign: dict) -> str:
 
     # POST OP
     if assign.get("post_op"):
-        lines.append(f"{len(assign['post_op'])} Post Op\n")
+        lines.append(f"*{len(assign['post_op'])} Post Op*\n")
         for i, p in enumerate(assign["post_op"], start=1):
             lines.append(f"{i}. {p['name']}\n")
             for pl in p["pod_lines"]:
@@ -364,7 +384,7 @@ def format_wa_text(assign: dict) -> str:
 
     # PRE OP
     if assign.get("pre_op"):
-        lines.append(f"{len(assign['pre_op'])} Pre op\n")
+        lines.append(f"*{len(assign['pre_op'])} Pre op*\n")
         for i, p in enumerate(assign["pre_op"], start=1):
             lines.append(f"{i}. {p['name']}\n")
             lines.append(f"Soap : {', '.join(p['soap'])}\n")
@@ -373,7 +393,7 @@ def format_wa_text(assign: dict) -> str:
 
     # IGD
     if assign.get("igd"):
-        lines.append("IGD\n")
+        lines.append("*IGD*\n")
         for i, p in enumerate(assign["igd"], start=1):
             lines.append(f"{i}. {p['name']}\n")
             lines.append(f"Soap : {', '.join(p['soap'])}\n")
@@ -381,8 +401,6 @@ def format_wa_text(assign: dict) -> str:
             lines.append(f"ER : {', '.join(p['er'])}\n\n")
 
     # Footer
-    obs = ", ".join(assign.get("observer") or [])
-    lines.append(f"Observer : {obs}\n\n")
     lines.append(f"ERM : {assign.get('erm_manual','')}\n")
     lines.append(f"Review : {assign.get('review_manual','')}\n")
 
@@ -421,7 +439,7 @@ with tab_use:
                     f"A13: {', '.join(r.get('a13',[]))}",
                     f"A14: {', '.join(r.get('a14',[]))}",
                     f"A15: {', '.join(r.get('a15',[]))}",
-                    f"Observer: {', '.join(r.get('observers',[]))}",
+                    f"A16: {', '.join(r.get('observers',[]))}",
                 ])
             )
 

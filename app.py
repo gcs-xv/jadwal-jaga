@@ -550,94 +550,77 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                 })
 
     # =========================
-    # PRE OP (A15-centered executor logic, strict)
+    # PRE OP (A15 ANCHORED TEAM ENGINE)
     # =========================
     if pre_ops:
         n = len(pre_ops)
 
-        used_a15 = {x: 0 for x in a15_s}
-        per_patient = []
+        # A15 are core executors
+        core = a15_s[:] if a15_s else []
 
-        def next_a15():
-            if not a15_s:
-                return None
-            ordered = sorted(a15_s, key=lambda x: (used_a15.get(x, 0), x.lower()))
-            chosen = ordered[0]
-            used_a15[chosen] += 1
-            return chosen
+        # If no A15, fallback to everyone
+        if not core:
+            core = all_people()
 
-        for i, p in enumerate(pre_ops):
+        # Deterministic order
+        core = shuffled(core, iso_date, "pre:core")
 
-            # --- pick executor(s) from A15 ---
-            if not a15_s:
-                exec_soap = None
-                exec_tsr = None
-            elif n == 1:
-                # 1 patient → 1 executor handles all visible roles
-                exec_soap = next_a15()
-                exec_tsr = exec_soap
-            elif n == 2:
-                # 2 patients → 2 executors per patient if possible
-                exec_soap = next_a15()
-                exec_tsr = next_a15() if len(a15_s) > 1 else exec_soap
+        # Distribute core evenly across patients
+        core_groups = [[] for _ in range(n)]
+        for i, name in enumerate(core):
+            core_groups[i % n].append(name)
+
+        # Now attach other cohorts to each core group
+        cohorts = {
+            "a12": a12_s,
+            "a13": a13_s,
+            "a14": a14_s,
+            "a16": a16_s,
+        }
+
+        cohort_groups = {k: [[] for _ in range(n)] for k in cohorts.keys()}
+
+        for k, members in cohorts.items():
+            shuffled_members = shuffled(members, iso_date, f"pre:{k}")
+            for i, name in enumerate(shuffled_members):
+                cohort_groups[k][i % n].append(name)
+
+        for idx, p in enumerate(pre_ops):
+            team = core_groups[idx][:]
+            for k in cohorts.keys():
+                team += cohort_groups[k][idx]
+
+            team = cohort_order(uniq(team))
+
+            # If 1 patient → everyone does everything
+            if n == 1:
+                soap = team[:]
+                tsr = team[:]
+                rm = team[:]
             else:
-                # 3+ patients → 1 executor per patient, alternate role
-                exec_soap = next_a15()
-                exec_tsr = exec_soap
+                # Split team roles based on core size
+                core_team = core_groups[idx]
 
-            soap = []
-            tsr = []
-            rm = []
+                # If 1 executor → handles all roles
+                if len(core_team) == 1:
+                    soap = team[:]
+                    tsr = team[:]
+                    rm = team[:]
+                else:
+                    # Split core between SOAP and TSR
+                    half = (len(core_team) + 1) // 2
+                    soap_core = core_team[:half]
+                    tsr_core = core_team[half:]
 
-            # --- ensure representation A12–A16 in SOAP ---
-            for pool in [a12_s, a13_s, a14_s, a16_s]:
-                if pool:
-                    soap.append(pool[i % len(pool)])
+                    soap = cohort_order(uniq(soap_core + cohort_groups["a12"][idx] + cohort_groups["a13"][idx]))
+                    tsr = cohort_order(uniq(tsr_core + cohort_groups["a14"][idx] + cohort_groups["a16"][idx]))
+                    rm = cohort_order(uniq(team))
 
-            if exec_soap:
-                soap.append(exec_soap)
-
-            # --- ensure representation A12–A16 in TSR ---
-            for pool in [a12_s, a13_s, a14_s, a16_s]:
-                if pool:
-                    tsr.append(pool[(i + 1) % len(pool)])
-
-            if exec_tsr:
-                tsr.append(exec_tsr)
-
-            soap = cohort_order(uniq(soap))
-            tsr = cohort_order(uniq(tsr))
-
-            # RM/ERM = union + guarantee all A15 appear at least somewhere
-            rm = cohort_order(uniq(soap + tsr))
-
-            per_patient.append({
+            out["pre_op"].append({
                 "name": p["name"],
                 "soap": soap,
+                "rm_erm": rm,
                 "tsr": tsr,
-                "rm_erm": rm
-            })
-
-        # ensure all A15 appear in PRE OP at least once
-        appeared = set()
-        for pp in per_patient:
-            appeared.update(pp["soap"])
-            appeared.update(pp["tsr"])
-            appeared.update(pp["rm_erm"])
-
-        missing_a15 = [x for x in a15_s if x not in appeared]
-
-        for x in missing_a15:
-            # inject into smallest RM/ERM bucket
-            smallest = min(per_patient, key=lambda pp: len(pp["rm_erm"]))
-            smallest["rm_erm"] = cohort_order(uniq(smallest["rm_erm"] + [x]))
-
-        for pp in per_patient:
-            out["pre_op"].append({
-                "name": pp["name"],
-                "soap": pp["soap"],
-                "rm_erm": pp["rm_erm"],
-                "tsr": pp["tsr"],
             })
 
     # =========================

@@ -261,26 +261,46 @@ def pick_least_used(pool: list[str], k: int, used: dict, iso_date: str, salt: st
 
 def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list, igds: list,
                      erm_manual: str, review_manual: str):
-    # Cohort pools
+    # Cohort pools (from roster)
     a12 = roster.get("a12") or []
     a13 = roster.get("a13") or []
     a14 = roster.get("a14") or []
     a15 = roster.get("a15") or []
-    a16 = roster.get("observers") or []  # angkatan 16 now participates (no separate observer section)
+    a16 = roster.get("observers") or []  # A16 participates officially (no separate observer section)
 
-    # Deterministic shuffle per date (so re-generate same date => same pairing/rotation)
+    # Deterministic shuffle per date (so regenerate same date => same result)
     a12_s = shuffled(a12, iso_date, "rot:a12")
     a13_s = shuffled(a13, iso_date, "rot:a13")
     a14_s = shuffled(a14, iso_date, "rot:a14")
     a15_s = shuffled(a15, iso_date, "rot:a15")
     a16_s = shuffled(a16, iso_date, "rot:a16")
 
+    def cohort_order(team: list[str]) -> list[str]:
+        """Force output order: A12 → A13 → A14 → A15 → A16 (each in the roster-shuffled order)."""
+        s = set(team or [])
+        out = []
+        for x in a12_s:
+            if x in s: out.append(x)
+        for x in a13_s:
+            if x in s: out.append(x)
+        for x in a14_s:
+            if x in s: out.append(x)
+        for x in a15_s:
+            if x in s: out.append(x)
+        for x in a16_s:
+            if x in s: out.append(x)
+        return uniq(out)
+
+    def all_people() -> list[str]:
+        return uniq(a12_s + a13_s + a14_s + a15_s + a16_s)
+
+    # Deterministic pairs for A14/A15 (pairing stays consistent within the date)
     def make_pairs(xs: list[str]) -> list[list[str]]:
         pairs = []
         i = 0
         while i < len(xs):
             if i + 1 < len(xs):
-                pairs.append([xs[i], xs[i+1]])
+                pairs.append([xs[i], xs[i + 1]])
                 i += 2
             else:
                 pairs.append([xs[i]])
@@ -290,7 +310,6 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     a14_pairs = make_pairs(a14_s)
     a15_pairs = make_pairs(a15_s)
 
-    # Simple rotators (deterministic because inputs are shuffled deterministically)
     class Rot:
         def __init__(self, items):
             self.items = items[:] if items else []
@@ -308,41 +327,115 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     r15 = Rot(a15_pairs)
     r16 = Rot(a16_s)
 
-    def core_team_12_15():
+    # Track who already got ANY jobdesk today
+    unused = set(all_people())
+
+    def take_from_rot(rot: Rot, k: int) -> list[str]:
+        picked = []
+        seen_guard = 0
+        while len(picked) < k and rot.items and seen_guard < (len(rot.items) * 3 + 10):
+            v = rot.next()
+            if v is None:
+                break
+            # v can be a pair list or a string
+            if isinstance(v, list):
+                for x in v:
+                    if x and x not in picked:
+                        picked.append(x)
+                        if len(picked) >= k:
+                            break
+            else:
+                if v and v not in picked:
+                    picked.append(v)
+            seen_guard += 1
+        return picked
+
+    def pick_k_for_role(k: int, salt: str) -> list[str]:
         """
-        Core team for a patient:
-        A12 (1) + A13 (1) + A14 pair (up to 2) + A15 pair (up to 2)
-        Ordered: A12, A13, A14..., A15...
-        Target size is 6 if available.
+        Pick k people prioritizing those still unused, but keep cohort structure.
+        We try to include: A12 (if exists), A13 (if exists), A14 pair, A15 pair, then A16,
+        then fill remaining from anyone.
         """
-        t = []
-        x12 = r12.next()
-        x13 = r13.next()
-        p14 = r14.next() or []
-        p15 = r15.next() or []
+        k = max(1, min(k, len(all_people())))
+        picked = []
 
-        if x12:
-            t.append(x12)
-        if x13:
-            t.append(x13)
-        t += [x for x in p14 if x]
-        t += [x for x in p15 if x]
-        return uniq(t)
+        # 1) ensure 1 A12 + 1 A13 if possible (prefer unused)
+        if a12_s:
+            cand = [x for x in a12_s if x in unused]
+            picked += cand[:1] if cand else [a12_s[0]]
+        if a13_s and len(picked) < k:
+            cand = [x for x in a13_s if x in unused and x not in picked]
+            picked += cand[:1] if cand else [a13_s[0]]
 
-    def attach_a16_last(team: list[str], want: bool = True) -> list[str]:
-        if not want:
-            return team
-        x16 = r16.next()
-        if not x16:
-            return team
-        # Always place A16 at the end (after A15)
-        if x16 in team:
-            return team
-        return team + [x16]
+        # 2) add one A14 pair and one A15 pair (prefer unused inside the pair)
+        if len(picked) < k and a14_pairs:
+            pair = r14.next() or []
+            pair = [x for x in pair if x]
+            # prioritize unused members of the pair
+            pair_u = [x for x in pair if x in unused and x not in picked]
+            pair_r = [x for x in pair if x not in picked]
+            for x in (pair_u + pair_r):
+                if len(picked) < k and x not in picked:
+                    picked.append(x)
 
-    def pick_first_n(team: list[str], n: int) -> list[str]:
-        n = max(1, n)
-        return team[: min(n, len(team))]
+        if len(picked) < k and a15_pairs:
+            pair = r15.next() or []
+            pair = [x for x in pair if x]
+            pair_u = [x for x in pair if x in unused and x not in picked]
+            pair_r = [x for x in pair if x not in picked]
+            for x in (pair_u + pair_r):
+                if len(picked) < k and x not in picked:
+                    picked.append(x)
+
+        # 3) add one A16 if available and still need
+        if len(picked) < k and a16_s:
+            cand = [x for x in a16_s if x in unused and x not in picked]
+            if cand:
+                picked.append(cand[0])
+            else:
+                # deterministic pick
+                picked.append(a16_s[0])
+
+        # 4) fill the rest by taking from everyone, prioritizing unused, deterministic by shuffled order
+        everyone = shuffled(all_people(), iso_date, f"fill:{salt}")
+        for x in everyone:
+            if len(picked) >= k:
+                break
+            if x in picked:
+                continue
+            # prefer unused first
+            if x in unused:
+                picked.append(x)
+        # if still short, allow repeats
+        for x in everyone:
+            if len(picked) >= k:
+                break
+            if x in picked:
+                continue
+            picked.append(x)
+
+        # mark used
+        for x in picked:
+            if x in unused:
+                unused.remove(x)
+
+        return cohort_order(picked)
+
+    def split_all_people_into_two_teams() -> tuple[list[str], list[str]]:
+        """
+        Split fairly within each cohort: roughly half to team1, rest to team2.
+        Keep cohort order in each team.
+        """
+        t1 = []
+        t2 = []
+        for cohort in [a12_s, a13_s, a14_s, a15_s, a16_s]:
+            n = len(cohort)
+            if n == 0:
+                continue
+            half = (n + 1) // 2
+            t1 += cohort[:half]
+            t2 += cohort[half:]
+        return (cohort_order(t1), cohort_order(t2))
 
     out = {
         "date": iso_date,
@@ -356,85 +449,72 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
         "igd": [],
     }
 
-    # ---------- PRE OP (work-heavy) ----------
-    # Strategy:
-    # - RM/ERM uses core team (6-ish from A12-15)
-    # - SOAP and TSR use 4 names, with A16 rotated in as the LAST name (if available)
-    for idx, p in enumerate(pre_ops, start=1):
-        core = core_team_12_15()
-        rm_erm = core
-
-        soap = pick_first_n(core, 3)
-        soap = attach_a16_last(soap, want=True)  # include A16 when possible
-        if len(soap) < 4:
-            soap = pick_first_n(core, 4)
-
-        tsr = pick_first_n(core[1:] + core[:1], 3)  # slight rotation vs SOAP
-        tsr = attach_a16_last(tsr, want=True)
-        if len(tsr) < 4:
-            tsr = pick_first_n(core, 4)
-
-        out["pre_op"].append({
-            "name": p["name"],
-            "soap": uniq(soap),
-            "rm_erm": uniq(rm_erm),
-            "tsr": uniq(tsr),
-        })
-
-    # ---------- IGD ----------
-    # Strategy:
-    # - RM/ERM uses core team
-    # - SOAP uses 4, with A16 last if available
-    # - ER uses 3, with A16 last if available
-    for idx, p in enumerate(igds, start=1):
-        core = core_team_12_15()
-        rm_erm = core
-
-        soap = pick_first_n(core, 3)
-        soap = attach_a16_last(soap, want=True)
-        if len(soap) < 4:
-            soap = pick_first_n(core, 4)
-
-        er = pick_first_n([x for x in core if x], 2)
-        er = attach_a16_last(er, want=True)
-        if len(er) < 3:
-            er = pick_first_n(core, 3)
-
-        out["igd"].append({
-            "name": p["name"],
-            "soap": uniq(soap),
-            "rm_erm": uniq(rm_erm),
-            "er": uniq(er),
-        })
-
-    # ---------- POST OP (visit) ----------
-    # Rule:
-    # - If ONLY 1 post-op patient: split POD lines into 2 different teams (team1/team2)
-    # - If 2+ post-op patients: SAME team for both POD lines per patient
+    # ---------- POST OP ----------
     total_post = len(post_ops)
-
     for idx, p in enumerate(post_ops, start=1):
         labels = normalize_pod_label(p.get("meta", "")) or ("POD I", "POD II")
 
         if total_post == 1:
-            team1 = core_team_12_15()
-            team2 = core_team_12_15()
+            team1, team2 = split_all_people_into_two_teams()
+            # Everyone gets jobdesk from post-op split
+            unused.clear()
             out["post_op"].append({
                 "name": p["name"],
                 "pod_lines": [
-                    {"label": labels[0], "team": uniq(team1)},
-                    {"label": labels[1], "team": uniq(team2)},
+                    {"label": labels[0], "team": team1},
+                    {"label": labels[1], "team": team2},
                 ]
             })
         else:
-            team = core_team_12_15()
+            # per patient: one stable team for both POD lines, size 6 (adapt)
+            k = min(6, max(1, len(all_people())))
+            team = pick_k_for_role(k, f"post{idx}")
             out["post_op"].append({
                 "name": p["name"],
                 "pod_lines": [
-                    {"label": labels[0], "team": uniq(team)},
-                    {"label": labels[1], "team": uniq(team)},
+                    {"label": labels[0], "team": team},
+                    {"label": labels[1], "team": team},
                 ]
             })
+
+    # ---------- PRE OP ----------
+    # Role sizes (adapt down if fewer people)
+    k_soap = min(4, max(1, len(all_people())))
+    k_rm = min(6, max(1, len(all_people())))
+    k_tsr = min(4, max(1, len(all_people())))
+
+    for idx, p in enumerate(pre_ops, start=1):
+        soap = pick_k_for_role(k_soap, f"pre{idx}:soap")
+        rm_erm = pick_k_for_role(k_rm, f"pre{idx}:rm")
+        tsr = pick_k_for_role(k_tsr, f"pre{idx}:tsr")
+        out["pre_op"].append({
+            "name": p["name"],
+            "soap": soap,
+            "rm_erm": rm_erm,
+            "tsr": tsr,
+        })
+
+    # ---------- IGD ----------
+    k_er = min(3, max(1, len(all_people())))
+    for idx, p in enumerate(igds, start=1):
+        soap = pick_k_for_role(k_soap, f"igd{idx}:soap")
+        rm_erm = pick_k_for_role(k_rm, f"igd{idx}:rm")
+        er = pick_k_for_role(k_er, f"igd{idx}:er")
+        out["igd"].append({
+            "name": p["name"],
+            "soap": soap,
+            "rm_erm": rm_erm,
+            "er": er,
+        })
+
+    # If there are PRE/IGD tasks and some people are still unused, force-assign them into the last RM/ERM (append, keep order)
+    if (pre_ops or igds) and unused:
+        leftovers = cohort_order(list(unused))
+        if out["igd"]:
+            out["igd"][-1]["rm_erm"] = cohort_order(out["igd"][-1]["rm_erm"] + leftovers)
+        elif out["pre_op"]:
+            out["pre_op"][-1]["rm_erm"] = cohort_order(out["pre_op"][-1]["rm_erm"] + leftovers)
+        unused.clear()
 
     return out
 

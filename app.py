@@ -887,19 +887,19 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                 soap = ensure_role_has(soap, a12_r, i)
                 soap = ensure_role_has(soap, a13_r, i)
                 soap = ensure_role_has(soap, a14_r, i)
-                soap = ensure_role_has(soap, a15_r, i)
+                # DO NOT auto-insert A15 here — A15 distribution is handled strictly by the A15 rule above
                 soap = ensure_role_has(soap, a16_r, i)
 
                 rm = ensure_role_has(rm, a12_r, i + 2)
                 rm = ensure_role_has(rm, a13_r, i + 2)
                 rm = ensure_role_has(rm, a14_r, i + 2)
-                rm = ensure_role_has(rm, a15_r, i + 2)
+                # A15 must follow strict per‑patient distribution (2,2,... remainder on last)
                 rm = ensure_role_has(rm, a16_r, i + 2)
 
                 tsr = ensure_role_has(tsr, a12_r, i + 1)
                 tsr = ensure_role_has(tsr, a13_r, i + 1)
                 tsr = ensure_role_has(tsr, a14_r, i + 1)
-                tsr = ensure_role_has(tsr, a15_r, i + 1)
+                # A15 already assigned earlier (SOAP/TSR logic)
                 tsr = ensure_role_has(tsr, a16_r, i + 1)
 
                 # Make sure across the whole PRE OP section, everyone appears at least once:

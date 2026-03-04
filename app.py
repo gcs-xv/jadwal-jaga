@@ -605,33 +605,69 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                     ]
                 })
             else:
-                # stable team per patient: guarantee at least one from each cohort, distribute extras fairly
+                # Multi-patient POST OP: build stable teams first (min 1 from each cohort per patient)
                 n = total_post
+
+                # Build teams only once
+                if "_post_teams" not in out:
+                    teams = [[] for _ in range(n)]
+
+                    # 1) Base members (guarantee A12–A16 presence per patient if available)
+                    for i_team in range(n):
+                        base = []
+                        if a12_s:
+                            base.append(a12_s[i_team % len(a12_s)])
+                        if a13_s:
+                            base.append(a13_s[i_team % len(a13_s)])
+                        if a14_s:
+                            base.append(a14_s[i_team % len(a14_s)])
+                        if a15_s:
+                            base.append(a15_s[i_team % len(a15_s)])
+                        if a16_s:
+                            base.append(a16_s[i_team % len(a16_s)])
+                        teams[i_team].extend(base)
+
+                    # 2) Distribute remaining people per cohort round-robin (so everyone appears)
+                    #    This is DISJOINT distribution within a cohort (except when cohort size < n).
+                    def distribute_extras(pool):
+                        if not pool:
+                            return
+                        for j, name in enumerate(pool):
+                            tgt = j % n
+                            # avoid duplicating the same person twice in the same team
+                            if name not in teams[tgt]:
+                                teams[tgt].append(name)
+
+                    distribute_extras(a12_s)
+                    distribute_extras(a13_s)
+                    distribute_extras(a14_s)
+                    distribute_extras(a15_s)
+                    distribute_extras(a16_s)
+
+                    # 3) Finalize ordering + ensure minimum team size
+                    finalized = []
+                    everyone = all_people()
+                    for i_team in range(n):
+                        t = cohort_order(uniq(teams[i_team]))
+
+                        # If somehow the team is still too small (edge cases), pad using global order
+                        # This should never happen in normal cases, but prevents 1–2 people teams.
+                        if len(t) < 5 and everyone:
+                            for name in everyone:
+                                if name not in t:
+                                    t.append(name)
+                                if len(t) >= 5:
+                                    break
+                            t = cohort_order(uniq(t))
+
+                        finalized.append(t)
+
+                    # Enforce blacklist across teams (best effort)
+                    finalized = enforce_blacklist_many(finalized)
+                    out["_post_teams"] = [cohort_order(t) for t in finalized]
+
                 i = idx - 1
-
-                # Ensure every patient gets at least one from each cohort
-                base_team = []
-                if a12_s:
-                    base_team.append(a12_s[i % len(a12_s)])
-                if a13_s:
-                    base_team.append(a13_s[i % len(a13_s)])
-                if a14_s:
-                    base_team.append(a14_s[i % len(a14_s)])
-                if a15_s:
-                    base_team.append(a15_s[i % len(a15_s)])
-                if a16_s:
-                    base_team.append(a16_s[i % len(a16_s)])
-
-                # Distribute remaining people fairly across patients
-                extras = []
-                for pool in [a12_s, a13_s, a14_s, a15_s, a16_s]:
-                    for j, name in enumerate(pool):
-                        if j % n == i and name not in base_team:
-                            extras.append(name)
-
-                team = cohort_order(uniq(base_team + extras))
-
-                out.setdefault("_post_teams_cache", []).append(team)
+                team = out["_post_teams"][i]
 
                 out["post_op"].append({
                     "name": p["name"],
@@ -640,14 +676,6 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                         {"label": labels[1], "team": team},
                     ]
                 })
-
-        # After building all teams, enforce blacklist across patients, then write back (only for multi-patient)
-        if post_ops and total_post > 1 and len(post_ops) == len(out["post_op"]):
-            post_teams_cache = [entry["pod_lines"][0]["team"] for entry in out["post_op"]]
-            post_teams_cache = enforce_blacklist_many(post_teams_cache)
-            for k, entry in enumerate(out["post_op"]):
-                entry["pod_lines"][0]["team"] = cohort_order(post_teams_cache[k])
-                entry["pod_lines"][1]["team"] = cohort_order(post_teams_cache[k])
 
     # =========================
     # PRE OP (STRICT + ALL NAMES MUST APPEAR)

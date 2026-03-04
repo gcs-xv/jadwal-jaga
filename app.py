@@ -777,9 +777,7 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
             # RM/ERM: 1 A12, 1 A13, 1 A14, 2 A15, 2 A16  (heavy)
             # TSR: 1 A12, 1 A13, 1 A14, 1 A15, 2 A16     (heavy)
             #
-            # This branch enforces exactly 1 A15 in SOAP, 1 A15 in TSR, and RM/ERM gets both (2 A15).
-
-            a15_usage = {x: 0 for x in a15_r}
+            # This branch enforces new A15 distribution rule.
 
             # Precompute reps per patient index to keep stable + fair
             reps = []
@@ -806,19 +804,37 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
             for i, p in enumerate(pre_ops):
                 rrep = reps[i]
 
-                # Decide A15 executors for this patient (fixed weights per patient)
-                # SOAP gets 1 A15, TSR gets 1 A15, RM/ERM gets 2 A15 (SOAP A15 + TSR A15)
+                # ---- A15 distribution rule ----
+                # Default: each patient gets 2 A15 (SOAP + TSR)
+                # If PRE OP patients exceed clean pairing, the LAST patient absorbs remaining A15
+                a15_soap = None
+                a15_tsr = None
+                a15_extra_rm = []
+
                 if a15_r:
-                    # pick least-used A15 for fairness; try to avoid duplicates when possible
-                    a15_soap = pick_least_used(a15_r, 1, a15_usage, iso_date, f"pre:a15:soap:{i}")[0]
-                    remaining = [x for x in a15_r if x != a15_soap]
-                    if remaining:
-                        a15_tsr = pick_least_used(remaining, 1, a15_usage, iso_date, f"pre:a15:tsr:{i}")[0]
+                    total_a15 = len(a15_r)
+                    base_per_patient = 2
+
+                    # how many would be consumed before this patient
+                    used_before = i * base_per_patient
+
+                    # if last patient → absorb remainder
+                    if i == n - 1:
+                        remaining = a15_r[used_before:] if used_before < total_a15 else []
+                        if remaining:
+                            a15_soap = remaining[0]
+                        if len(remaining) > 1:
+                            a15_tsr = remaining[1]
+                        if len(remaining) > 2:
+                            a15_extra_rm = remaining[2:]
                     else:
-                        a15_tsr = a15_soap
-                else:
-                    a15_soap = None
-                    a15_tsr = None
+                        slice_start = used_before
+                        slice_end = slice_start + base_per_patient
+                        pair = a15_r[slice_start:slice_end]
+                        if pair:
+                            a15_soap = pair[0]
+                        if len(pair) > 1:
+                            a15_tsr = pair[1]
 
                 # ---- SOAP (target 5 people) ----
                 soap = [
@@ -830,7 +846,7 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                 ]
 
                 # ---- RM/ERM (heavy) ----
-                # Must contain 2 A15: (SOAP A15 + TSR A15)
+                # Must contain 2 A15: (SOAP A15 + TSR A15), and absorb extra A15 if last patient
                 rm = [
                     rrep["a12_rm"],
                     rrep["a13_rm"],
@@ -839,7 +855,7 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                     a15_tsr,
                     rrep["a16_rm_1"],
                     rrep["a16_rm_2"],
-                ]
+                ] + a15_extra_rm
 
                 # ---- TSR (heavy) ----
                 # Must contain exactly 1 A15: TSR executor only

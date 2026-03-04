@@ -217,6 +217,13 @@ def parse_roster_csv(uploaded_file):
 # ---------- Assignment generation ----------
 DAY_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
 
+# ---------- pairing blacklist ----------
+# Hard constraint: these two must NEVER be in the same team/role line.
+BLACKLIST_PAIRS = {
+    ("Ferrel", "Maman"),
+    ("Maman", "Ferrel"),
+}
+
 def iso_to_dayname(iso_date: str) -> str:
     y, m, d = [int(x) for x in iso_date.split("-")]
     wd = dt_date(y, m, d).weekday()  # Mon=0
@@ -378,6 +385,72 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     def all_people() -> list[str]:
         return uniq(a12_s + a13_s + a14_s + a15_s + a16_s)
 
+    # ---- blacklist enforcement ----
+    def violates_blacklist(team: list[str]) -> bool:
+        s = set(team or [])
+        for a, b in BLACKLIST_PAIRS:
+            if a in s and b in s:
+                return True
+        return False
+
+    def move_one_blacklisted(team_from: list[str], team_to: list[str]) -> tuple[list[str], list[str]]:
+        """
+        If a blacklisted pair exists in team_from, move one member to team_to.
+        Keeps ordering later via cohort_order().
+        """
+        s = set(team_from or [])
+        for a, b in BLACKLIST_PAIRS:
+            if a in s and b in s:
+                # move b first (arbitrary but deterministic)
+                if b in team_from:
+                    team_from = [x for x in team_from if x != b]
+                    team_to = team_to + [b]
+                    return (team_from, team_to)
+                if a in team_from:
+                    team_from = [x for x in team_from if x != a]
+                    team_to = team_to + [a]
+                    return (team_from, team_to)
+        return (team_from, team_to)
+
+    def enforce_blacklist_two_teams(t1: list[str], t2: list[str]) -> tuple[list[str], list[str]]:
+        """
+        Ensure no team contains a blacklisted pair by moving one person across teams.
+        """
+        # Try a few passes (small problem size)
+        for _ in range(4):
+            if violates_blacklist(t1):
+                t1, t2 = move_one_blacklisted(t1, t2)
+            if violates_blacklist(t2):
+                t2, t1 = move_one_blacklisted(t2, t1)
+        return (t1, t2)
+
+    def enforce_blacklist_many(teams: list[list[str]]) -> list[list[str]]:
+        """
+        Ensure blacklisted pairs are not in the same team across a list of teams.
+        Best-effort: swap within the same cohort pool by moving one member to the next team.
+        """
+        if not teams:
+            return teams
+        for _ in range(6):
+            changed = False
+            for i in range(len(teams)):
+                if violates_blacklist(teams[i]):
+                    j = (i + 1) % len(teams)
+                    a, b = None, None
+                    s = set(teams[i])
+                    for x, y in BLACKLIST_PAIRS:
+                        if x in s and y in s:
+                            a, b = x, y
+                            break
+                    # move y to next team
+                    if a and b:
+                        teams[i] = [z for z in teams[i] if z != b]
+                        teams[j] = teams[j] + [b]
+                        changed = True
+            if not changed:
+                break
+        return teams
+
     # Pairing for A14/A15 (stable per date)
     def make_pairs(xs: list[str]) -> list[list[str]]:
         pairs = []
@@ -426,7 +499,10 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
             half = (n + 1) // 2
             t1 += cohort[:half]
             t2 += cohort[half:]
-        return (cohort_order(t1), cohort_order(t2))
+        t1o = cohort_order(t1)
+        t2o = cohort_order(t2)
+        t1o, t2o = enforce_blacklist_two_teams(t1o, t2o)
+        return (cohort_order(t1o), cohort_order(t2o))
 
     # ---- Role assignment from per-patient buckets ----
     def assign_roles_from_buckets(buckets: dict, mode: str):
@@ -529,17 +605,33 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                     ]
                 })
             else:
-                # stable team per patient: split each cohort across patients (disjoint, fair, includes A16)
+                # stable team per patient: guarantee at least one from each cohort, distribute extras fairly
                 n = total_post
-                t12 = split_even_people(a12_s, n, "post:a12")
-                t13 = split_even_people(a13_s, n, "post:a13")
-                t14 = split_even_pairs(a14_pairs, n, "post:a14pairs")
-                t15 = split_even_pairs(a15_pairs, n, "post:a15pairs")
-                t16 = split_even_people(a16_s, n, "post:a16")
-
                 i = idx - 1
-                team = cohort_order((t12[i] if t12 else []) + (t13[i] if t13 else []) + (t14[i] if t14 else []) +
-                                    (t15[i] if t15 else []) + (t16[i] if t16 else []))
+
+                # Ensure every patient gets at least one from each cohort
+                base_team = []
+                if a12_s:
+                    base_team.append(a12_s[i % len(a12_s)])
+                if a13_s:
+                    base_team.append(a13_s[i % len(a13_s)])
+                if a14_s:
+                    base_team.append(a14_s[i % len(a14_s)])
+                if a15_s:
+                    base_team.append(a15_s[i % len(a15_s)])
+                if a16_s:
+                    base_team.append(a16_s[i % len(a16_s)])
+
+                # Distribute remaining people fairly across patients
+                extras = []
+                for pool in [a12_s, a13_s, a14_s, a15_s, a16_s]:
+                    for j, name in enumerate(pool):
+                        if j % n == i and name not in base_team:
+                            extras.append(name)
+
+                team = cohort_order(uniq(base_team + extras))
+
+                out.setdefault("_post_teams_cache", []).append(team)
 
                 out["post_op"].append({
                     "name": p["name"],
@@ -548,6 +640,14 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                         {"label": labels[1], "team": team},
                     ]
                 })
+
+        # After building all teams, enforce blacklist across patients, then write back (only for multi-patient)
+        if post_ops and total_post > 1 and len(post_ops) == len(out["post_op"]):
+            post_teams_cache = [entry["pod_lines"][0]["team"] for entry in out["post_op"]]
+            post_teams_cache = enforce_blacklist_many(post_teams_cache)
+            for k, entry in enumerate(out["post_op"]):
+                entry["pod_lines"][0]["team"] = cohort_order(post_teams_cache[k])
+                entry["pod_lines"][1]["team"] = cohort_order(post_teams_cache[k])
 
     # =========================
     # PRE OP (STRICT + ALL NAMES MUST APPEAR)
@@ -570,49 +670,52 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
         if n == 1:
             p = pre_ops[0]
 
-            # Strict composition rule for 1 Pre Op:
-            # SOAP: 1 A12, 1 A13, 1 A14, 1 A15, 1 A16
-            # RM/ERM: 1 A12, 1 A13, 1 A14, 2 A15, 2 A16
-            # TSR: 1 A12, 1 A13, 1 A14, 2 A15, 2 A16
-            # All names must appear at least once.
-
+            # Pick "double" + "rm-only" reps per cohort (fair within cohort)
             def pick(pool, idx):
                 if not pool:
                     return None
                 return pool[idx % len(pool)]
 
-            # --- SOAP ---
-            soap = [
-                pick(a12_r, 0),
-                pick(a13_r, 0),
-                pick(a14_r, 0),
-                pick(a15_r, 0),
-                pick(a16_r, 0),
-            ]
+            a12_double = pick(a12_r, 0)
+            a12_rm = pick(a12_r, 1 if len(a12_r) > 1 else 0)
 
-            # --- RM/ERM ---
+            a13_double = pick(a13_r, 0)
+            a13_rm = pick(a13_r, 1 if len(a13_r) > 1 else 0)
+
+            a14_double = pick(a14_r, 0)
+            a14_rm = pick(a14_r, 1 if len(a14_r) > 1 else 0)
+
+            # A15 core executors: 1 SOAP, 1 TSR, 2 RM
+            a15_soap = pick(a15_r, 0)
+            a15_tsr = pick(a15_r, 1 if len(a15_r) > 1 else 0)
+            a15_rm_1 = pick(a15_r, 2 if len(a15_r) > 2 else 0)
+            a15_rm_2 = pick(a15_r, 3 if len(a15_r) > 3 else (1 if len(a15_r) > 1 else 0))
+
+            # A16 distribution: 1 SOAP, 2 RM, 2 TSR (as available)
+            a16_soap = pick(a16_r, 0)
+            a16_rm_1 = pick(a16_r, 1 if len(a16_r) > 1 else 0)
+            a16_rm_2 = pick(a16_r, 2 if len(a16_r) > 2 else 0)
+            a16_tsr_1 = pick(a16_r, 3 if len(a16_r) > 3 else (1 if len(a16_r) > 1 else 0))
+            a16_tsr_2 = pick(a16_r, 4 if len(a16_r) > 4 else (2 if len(a16_r) > 2 else 0))
+
+            # --- SOAP ---
+            soap = [a12_double, a13_double, a14_double, a15_soap, a16_soap]
+
+            # --- RM/ERM (heavy) ---
             rm = [
-                pick(a12_r, 1),
-                pick(a13_r, 1),
-                pick(a14_r, 1),
-                pick(a15_r, 1),
-                pick(a15_r, 2),
-                pick(a16_r, 1),
-                pick(a16_r, 2),
+                a12_rm, a13_rm, a14_rm,
+                a15_rm_1, a15_rm_2,
+                a16_rm_1, a16_rm_2
             ]
 
             # --- TSR ---
             tsr = [
-                pick(a12_r, 0 if len(a12_r) == 1 else 1),
-                pick(a13_r, 0 if len(a13_r) == 1 else 1),
-                pick(a14_r, 0 if len(a14_r) == 1 else 1),
-                pick(a15_r, 2 if len(a15_r) > 2 else 0),
-                pick(a15_r, 3 if len(a15_r) > 3 else 1),
-                pick(a16_r, 2 if len(a16_r) > 2 else 0),
-                pick(a16_r, 3 if len(a16_r) > 3 else 1),
+                a12_double, a13_double, a14_double,
+                a15_tsr,
+                a16_tsr_1, a16_tsr_2
             ]
 
-            # Remove None and duplicates inside each role
+            # Clean role lists
             soap = cohort_order(uniq([x for x in soap if x]))
             rm = cohort_order(uniq([x for x in rm if x]))
             tsr = cohort_order(uniq([x for x in tsr if x]))
@@ -624,6 +727,14 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
             if missing:
                 rm = cohort_order(uniq(rm + list(missing)))
 
+            # Enforce blacklist: avoid Ferrel & Maman in the same role line if possible
+            if violates_blacklist(soap):
+                soap, rm = enforce_blacklist_two_teams(soap, rm)
+            if violates_blacklist(tsr):
+                tsr, rm = enforce_blacklist_two_teams(tsr, rm)
+            if violates_blacklist(rm):
+                rm, tsr = enforce_blacklist_two_teams(rm, tsr)
+
             out["pre_op"].append({
                 "name": p["name"],
                 "soap": soap,
@@ -633,35 +744,135 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
 
         # ===== CASE: MULTIPLE PRE OPS =====
         else:
+            # Target composition per patient (multi pre-op):
+            # SOAP: 1 A12, 1 A13, 1 A14, 1 A15, 1 A16
+            # RM/ERM: 1 A12, 1 A13, 1 A14, 2 A15, 2 A16  (heavy)
+            # TSR: 1 A12, 1 A13, 1 A14, 1 A15, 2 A16     (heavy)
+            #
+            # This branch enforces exactly 1 A15 in SOAP, 1 A15 in TSR, and RM/ERM gets both (2 A15).
+
+            a15_usage = {x: 0 for x in a15_r}
+
+            # Precompute reps per patient index to keep stable + fair
+            reps = []
+            for i in range(n):
+                reps.append({
+                    "a12_soap": pick_rot(a12_r, i),
+                    "a13_soap": pick_rot(a13_r, i),
+                    "a14_soap": pick_rot(a14_r, i),
+                    "a16_soap": pick_rot(a16_r, i),
+
+                    "a12_tsr": pick_rot(a12_r, i + 1),
+                    "a13_tsr": pick_rot(a13_r, i + 1),
+                    "a14_tsr": pick_rot(a14_r, i + 1),
+                    "a16_tsr_1": pick_rot(a16_r, i + 1),
+                    "a16_tsr_2": pick_rot(a16_r, i + 2),
+
+                    "a12_rm": pick_rot(a12_r, i + 2),
+                    "a13_rm": pick_rot(a13_r, i + 2),
+                    "a14_rm": pick_rot(a14_r, i + 2),
+                    "a16_rm_1": pick_rot(a16_r, i + 2),
+                    "a16_rm_2": pick_rot(a16_r, i + 3),
+                })
+
             for i, p in enumerate(pre_ops):
+                rrep = reps[i]
 
-                soap = []
-                tsr = []
-
-                soap += [
-                    pick_rot(a12_r, i),
-                    pick_rot(a13_r, i),
-                    pick_rot(a14_r, i),
-                    pick_rot(a16_r, i),
-                ]
-
-                tsr += [
-                    pick_rot(a12_r, i + 1),
-                    pick_rot(a13_r, i + 1),
-                    pick_rot(a14_r, i + 1),
-                    pick_rot(a16_r, i + 1),
-                ]
-
-                # distribute A15 evenly across patients
+                # Decide A15 executors for this patient (fixed weights per patient)
+                # SOAP gets 1 A15, TSR gets 1 A15, RM/ERM gets 2 A15 (SOAP A15 + TSR A15)
                 if a15_r:
-                    soap.append(a15_r[i % len(a15_r)])
-                    tsr.append(a15_r[(i + 1) % len(a15_r)])
+                    # pick least-used A15 for fairness; try to avoid duplicates when possible
+                    a15_soap = pick_least_used(a15_r, 1, a15_usage, iso_date, f"pre:a15:soap:{i}")[0]
+                    remaining = [x for x in a15_r if x != a15_soap]
+                    if remaining:
+                        a15_tsr = pick_least_used(remaining, 1, a15_usage, iso_date, f"pre:a15:tsr:{i}")[0]
+                    else:
+                        a15_tsr = a15_soap
+                else:
+                    a15_soap = None
+                    a15_tsr = None
 
+                # ---- SOAP (target 5 people) ----
+                soap = [
+                    rrep["a12_soap"],
+                    rrep["a13_soap"],
+                    rrep["a14_soap"],
+                    a15_soap,
+                    rrep["a16_soap"],
+                ]
+
+                # ---- RM/ERM (heavy) ----
+                # Must contain 2 A15: (SOAP A15 + TSR A15)
+                rm = [
+                    rrep["a12_rm"],
+                    rrep["a13_rm"],
+                    rrep["a14_rm"],
+                    a15_soap,
+                    a15_tsr,
+                    rrep["a16_rm_1"],
+                    rrep["a16_rm_2"],
+                ]
+
+                # ---- TSR (heavy) ----
+                # Must contain exactly 1 A15: TSR executor only
+                tsr = [
+                    rrep["a12_tsr"],
+                    rrep["a13_tsr"],
+                    rrep["a14_tsr"],
+                    a15_tsr,
+                    rrep["a16_tsr_1"],
+                    rrep["a16_tsr_2"],
+                ]
+
+                # Clean role lists
                 soap = cohort_order(uniq([x for x in soap if x]))
+                rm = cohort_order(uniq([x for x in rm if x]))
                 tsr = cohort_order(uniq([x for x in tsr if x]))
 
-                # RM/ERM heavy → union of both
-                rm = cohort_order(uniq(soap + tsr))
+                # Guarantee representation A12–A16 in EACH role if available
+                def ensure_role_has(role_list: list[str], pool: list[str], pick_idx: int):
+                    if not pool:
+                        return role_list
+                    if any(x in set(pool) for x in role_list):
+                        return role_list
+                    cand = pick_rot(pool, pick_idx)
+                    if cand:
+                        return cohort_order(uniq(role_list + [cand]))
+                    return role_list
+
+                soap = ensure_role_has(soap, a12_r, i)
+                soap = ensure_role_has(soap, a13_r, i)
+                soap = ensure_role_has(soap, a14_r, i)
+                soap = ensure_role_has(soap, a15_r, i)
+                soap = ensure_role_has(soap, a16_r, i)
+
+                rm = ensure_role_has(rm, a12_r, i + 2)
+                rm = ensure_role_has(rm, a13_r, i + 2)
+                rm = ensure_role_has(rm, a14_r, i + 2)
+                rm = ensure_role_has(rm, a15_r, i + 2)
+                rm = ensure_role_has(rm, a16_r, i + 2)
+
+                tsr = ensure_role_has(tsr, a12_r, i + 1)
+                tsr = ensure_role_has(tsr, a13_r, i + 1)
+                tsr = ensure_role_has(tsr, a14_r, i + 1)
+                tsr = ensure_role_has(tsr, a15_r, i + 1)
+                tsr = ensure_role_has(tsr, a16_r, i + 1)
+
+                # Make sure across the whole PRE OP section, everyone appears at least once:
+                # Put "missing" names into RM/ERM (heavy) for THIS patient (spread by index).
+                everyone = set(a12_r + a13_r + a14_r + a15_r + a16_r)
+                appeared = set()  # recomputed per patient below from global state
+                # We'll compute global appeared so far using out["pre_op"] already appended items
+                for prev in out["pre_op"]:
+                    appeared.update(prev.get("soap", []))
+                    appeared.update(prev.get("rm_erm", []))
+                    appeared.update(prev.get("tsr", []))
+                appeared.update(soap + rm + tsr)
+
+                missing = list(everyone - appeared)
+                if missing:
+                    missing = shuffled(missing, iso_date, f"pre:missing:{i}")
+                    rm = cohort_order(uniq(rm + missing[: max(0, 4 - (len(rm) % 4))]))  # add a few, not too many
 
                 out["pre_op"].append({
                     "name": p["name"],

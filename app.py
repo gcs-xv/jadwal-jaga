@@ -129,8 +129,8 @@ DEFAULT_CONFIG = {
         "a12": {"label": "Angkatan 12", "active": True, "jaga_level": "Jaga 4"},
         "a13": {"label": "Angkatan 13", "active": True, "jaga_level": "Jaga 3"},
         "a14": {"label": "Angkatan 14", "active": True, "jaga_level": "Jaga 2"},
-        "a15": {"label": "Angkatan 15", "active": True, "jaga_level": "Jaga 1"},
-        "observers": {"label": "Observers (A16)", "active": True, "jaga_level": "Observers"}
+        "a15": {"label": "Angkatan 15", "active": True, "jaga_level": "Jaga 2"},
+        "observers": {"label": "Observers (A16)", "active": True, "jaga_level": "Jaga 1"}
     },
     "blacklist": [
         ["Ferrel", "Maman"]
@@ -331,53 +331,119 @@ def shuffled(names: list[str], iso_date: str, salt: str):
     rng.shuffle(xs)
     return xs
 
-# ---------- Proportional Fair Distribution Algorithm ----------
-def distribute_cohort_to_patients(residents: list[str], patients: list[dict], iso_date: str, salt: str) -> list[list[str]]:
+# ---------- Helper to parse Jaga level weight ----------
+def get_jaga_weight(config: dict, cohort_key: str) -> int:
+    jaga_level_str = config["cohorts"].get(cohort_key, {}).get("jaga_level", "Jaga 1")
+    weight = 1
+    m_level = re.search(r"Jaga\s*([0-9]+)", jaga_level_str, re.IGNORECASE)
+    if m_level:
+        weight = int(m_level.group(1))
+    elif jaga_level_str.lower() == "observers":
+        weight = 1
+    return weight
+
+# ---------- Proportional Fair Distribution Algorithms ----------
+def distribute_cohort_to_roles(residents: list[str], patients: list[dict], weight: int, iso_date: str, salt: str, role_keys: list[str] = ["soap", "rm", "erm", "tsr"]) -> dict:
     """
-    Distribute list of residents from a cohort to patients as evenly as possible.
-    Returns a list of lists, where out[i] is the list of residents assigned to patients[i].
+    Distribute residents of a cohort to the patient role slots.
+    Each resident is assigned to exactly 'weight' distinct role slots.
+    Returns a dict: { patient_name: { role_key: [names] } }
     """
     m = len(patients)
     n = len(residents)
     
-    if m == 0 or n == 0:
-        return [[] for _ in range(m)]
+    # Initialize empty assignments
+    assignments = {p["name"]: {rk: [] for rk in role_keys} for p in patients}
+    
+    if m == 0 or n == 0 or weight <= 0:
+        return assignments
         
-    # Shuffle residents deterministically per day and salt to make it fair but stable
-    shuffled_res = shuffled(residents, iso_date, salt)
+    sh_res = shuffled(residents, iso_date, salt)
+    
+    # We loop over residents. For each resident, we assign them to exactly 'weight' distinct slots.
+    for r in sh_res:
+        assigned_slots = set() # Set of (patient_name, role_key) assigned to resident r
+        
+        max_possible_slots = m * len(role_keys)
+        actual_weight = min(weight, max_possible_slots)
+        
+        for _ in range(actual_weight):
+            best_p = None
+            best_rk = None
+            min_score = float('inf')
+            
+            # Shuffle keys deterministically for fair tie-breaking
+            patient_names = [p["name"] for p in patients]
+            rng_p = seeded_rng(iso_date, f"{salt}:sel_pat:{r}:{_}")
+            rng_p.shuffle(patient_names)
+            
+            sh_role_keys = list(role_keys)
+            rng_r = seeded_rng(iso_date, f"{salt}:sel_role:{r}:{_}")
+            rng_r.shuffle(sh_role_keys)
+            
+            for p_name in patient_names:
+                r_p_count = sum(1 for rk in role_keys if r in assignments[p_name][rk])
+                
+                for rk in sh_role_keys:
+                    if (p_name, rk) in assigned_slots:
+                        continue
+                        
+                    cohort_role_count = len(assignments[p_name][rk])
+                    
+                    # Score: prioritize patients with fewest assignments for this resident,
+                    # then role slots with fewest total cohort residents.
+                    score = (r_p_count * 1000) + cohort_role_count
+                    
+                    if score < min_score:
+                        min_score = score
+                        best_p = p_name
+                        best_rk = rk
+                        
+            if best_p and best_rk:
+                assignments[best_p][best_rk].append(r)
+                assigned_slots.add((best_p, best_rk))
+                
+    return assignments
+
+def distribute_cohort_to_patients_with_weight(residents: list[str], patients: list[dict], weight: int, iso_date: str, salt: str) -> list[list[str]]:
+    """
+    Distribute residents of a cohort to patients such that each resident covers 'weight' patients.
+    Returns a list of lists of names for each patient.
+    """
+    m = len(patients)
+    n = len(residents)
+    
     assignments = [[] for _ in range(m)]
     
-    if n >= m:
-        # Each patient gets at least floor(n/m) residents, and the remainder are distributed
-        base = n // m
-        rem = n % m
+    if m == 0 or n == 0 or weight <= 0:
+        return assignments
         
-        # Assign base residents to all patients
-        res_idx = 0
-        for i in range(m):
-            assignments[i].extend(shuffled_res[res_idx : res_idx + base])
-            res_idx += base
+    sh_res = shuffled(residents, iso_date, salt)
+    
+    for r in sh_res:
+        assigned_patients = set()
+        actual_weight = min(weight, m)
+        
+        for _ in range(actual_weight):
+            best_idx = -1
+            min_count = float('inf')
             
-        # Distribute the remainder deterministically but fairly across patients
-        rem_patient_indices = list(range(m))
-        rng = seeded_rng(iso_date, salt + "_rem_patients")
-        rng.shuffle(rem_patient_indices)
-        
-        for i in range(rem):
-            patient_idx = rem_patient_indices[i]
-            assignments[patient_idx].append(shuffled_res[res_idx])
-            res_idx += 1
-    else:
-        # n < m
-        # Each resident covers floor(m/n) or ceil(m/n) patients
-        patient_order = list(range(m))
-        rng = seeded_rng(iso_date, salt + "_patients")
-        rng.shuffle(patient_order)
-        
-        for idx, patient_idx in enumerate(patient_order):
-            res_idx = idx % n
-            assignments[patient_idx].append(shuffled_res[res_idx])
+            patient_indices = list(range(m))
+            rng = seeded_rng(iso_date, f"{salt}:r_pat:{r}:{_}")
+            rng.shuffle(patient_indices)
             
+            for idx in patient_indices:
+                if idx in assigned_patients:
+                    continue
+                count = len(assignments[idx])
+                if count < min_count:
+                    min_count = count
+                    best_idx = idx
+                    
+            if best_idx != -1:
+                assignments[best_idx].append(r)
+                assigned_patients.add(best_idx)
+                
     return assignments
 
 # ---------- Helper to identify which cohort a resident belongs to ----------
@@ -398,73 +464,6 @@ def sort_by_cohort(names: list[str], roster: dict) -> list[str]:
         return len(cohort_order)
         
     return sorted(list(set(names)), key=get_sort_key)
-
-# ---------- Role Assignment Logic based on seniority (Jaga Levels) ----------
-def assign_patient_roles_pre(patient_residents: list[str], config: dict, roster: dict) -> tuple[list[str], list[str], list[str]]:
-    soap = []
-    rm_erm = []
-    tsr = []
-    
-    for res in patient_residents:
-        cohort = find_resident_cohort(res, roster)
-        if not cohort:
-            continue
-        jaga_level = config["cohorts"].get(cohort, {}).get("jaga_level", "Jaga 1")
-        
-        if jaga_level in ["Jaga 1", "Observers"]:
-            soap.append(res)
-            rm_erm.append(res)
-        elif jaga_level == "Jaga 2":
-            rm_erm.append(res)
-            tsr.append(res)
-        elif jaga_level in ["Jaga 3", "Jaga 4"]:
-            tsr.append(res)
-            soap.append(res)
-            
-    # Guarantee representation in roles
-    all_res = sort_by_cohort(patient_residents, roster)
-    if all_res:
-        if not soap:
-            soap.append(all_res[0])
-        if not rm_erm:
-            rm_erm.append(all_res[-1])
-        if not tsr:
-            tsr.append(all_res[0])
-            
-    return soap, rm_erm, tsr
-
-def assign_patient_roles_igd(patient_residents: list[str], config: dict, roster: dict) -> tuple[list[str], list[str], list[str]]:
-    soap = []
-    rm_erm = []
-    er = []
-    
-    for res in patient_residents:
-        cohort = find_resident_cohort(res, roster)
-        if not cohort:
-            continue
-        jaga_level = config["cohorts"].get(cohort, {}).get("jaga_level", "Jaga 1")
-        
-        if jaga_level in ["Jaga 1", "Observers"]:
-            soap.append(res)
-            rm_erm.append(res)
-        elif jaga_level == "Jaga 2":
-            rm_erm.append(res)
-            er.append(res)
-        elif jaga_level in ["Jaga 3", "Jaga 4"]:
-            er.append(res)
-            soap.append(res)
-            
-    # Guarantee representation in roles
-    all_res = sort_by_cohort(patient_residents, roster)
-    if all_res:
-        if not soap:
-            soap.append(all_res[0])
-        if not rm_erm:
-            rm_erm.append(all_res[-1])
-        if not er:
-            er.append(all_res[0])
-            
-    return soap, rm_erm, er
 
 # ---------- Blacklist Resolvers ----------
 def enforce_blacklist_two_teams(t1: list[str], t2: list[str], config: dict, roster: dict) -> tuple[list[str], list[str]]:
@@ -684,7 +683,6 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
         if info.get("active", True):
             active_cohorts.append(c)
             
-    # Filter daily_roster to only active cohorts
     filtered_roster = {c: daily_roster.get(c, []) for c in active_cohorts}
     
     # 1. Build Post-Op assignments
@@ -716,11 +714,12 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
                 ]
             })
         else:
-            # Distribute cohorts proportionally
+            # Distribute cohort members to patients by their Jaga weight (patient count coverage)
             cohort_distributions = {}
             for c in active_cohorts:
                 pool = filtered_roster.get(c, [])
-                cohort_distributions[c] = distribute_cohort_to_patients(pool, post_ops, iso_date, f"post:{c}")
+                weight = get_jaga_weight(config, c)
+                cohort_distributions[c] = distribute_cohort_to_patients_with_weight(pool, post_ops, weight, iso_date, f"post:{c}")
                 
             # Combine into teams per patient
             patient_teams = [[] for _ in range(m)]
@@ -745,24 +744,35 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     pre_op_assignments = []
     if pre_ops:
         m = len(pre_ops)
-        cohort_distributions = {}
+        # We distribute the slots of each active cohort across the 4 roles of all patients
+        patient_assignments_dict = {p["name"]: {"soap": [], "rm_erm": [], "tsr": []} for p in pre_ops}
+        
         for c in active_cohorts:
             pool = filtered_roster.get(c, [])
-            cohort_distributions[c] = distribute_cohort_to_patients(pool, pre_ops, iso_date, f"pre:{c}")
+            weight = get_jaga_weight(config, c)
+            # Run distribution over 4 distinct roles: soap, rm, erm, tsr
+            cohort_alloc = distribute_cohort_to_roles(pool, pre_ops, weight, iso_date, f"pre:{c}", ["soap", "rm", "erm", "tsr"])
             
-        for i, p in enumerate(pre_ops):
-            patient_residents = []
-            for c in active_cohorts:
-                patient_residents.extend(cohort_distributions[c][i])
+            for p in pre_ops:
+                p_name = p["name"]
+                alloc = cohort_alloc.get(p_name, {"soap": [], "rm": [], "erm": [], "tsr": []})
                 
-            soap, rm_erm, tsr = assign_patient_roles_pre(patient_residents, config, daily_roster)
-            
-            soap = sort_by_cohort(soap, daily_roster)
-            rm_erm = sort_by_cohort(rm_erm, daily_roster)
-            tsr = sort_by_cohort(tsr, daily_roster)
+                # Combine rm and erm into rm_erm
+                rm_combined = alloc.get("rm", []) + alloc.get("erm", [])
+                
+                patient_assignments_dict[p_name]["soap"].extend(alloc.get("soap", []))
+                patient_assignments_dict[p_name]["rm_erm"].extend(rm_combined)
+                patient_assignments_dict[p_name]["tsr"].extend(alloc.get("tsr", []))
+                
+        # Transform back to ordered list and sort by seniority
+        for p in pre_ops:
+            p_name = p["name"]
+            soap = sort_by_cohort(patient_assignments_dict[p_name]["soap"], daily_roster)
+            rm_erm = sort_by_cohort(patient_assignments_dict[p_name]["rm_erm"], daily_roster)
+            tsr = sort_by_cohort(patient_assignments_dict[p_name]["tsr"], daily_roster)
             
             pre_op_assignments.append({
-                "name": p["name"],
+                "name": p_name,
                 "soap": soap,
                 "rm_erm": rm_erm,
                 "tsr": tsr
@@ -774,24 +784,31 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     igd_assignments = []
     if igds:
         m = len(igds)
-        cohort_distributions = {}
+        patient_assignments_dict = {p["name"]: {"soap": [], "rm_erm": [], "er": []} for p in igds}
+        
         for c in active_cohorts:
             pool = filtered_roster.get(c, [])
-            cohort_distributions[c] = distribute_cohort_to_patients(pool, igds, iso_date, f"igd:{c}")
+            weight = get_jaga_weight(config, c)
+            cohort_alloc = distribute_cohort_to_roles(pool, igds, weight, iso_date, f"igd:{c}", ["soap", "rm", "erm", "er"])
             
-        for i, p in enumerate(igds):
-            patient_residents = []
-            for c in active_cohorts:
-                patient_residents.extend(cohort_distributions[c][i])
+            for p in igds:
+                p_name = p["name"]
+                alloc = cohort_alloc.get(p_name, {"soap": [], "rm": [], "erm": [], "er": []})
                 
-            soap, rm_erm, er = assign_patient_roles_igd(patient_residents, config, daily_roster)
-            
-            soap = sort_by_cohort(soap, daily_roster)
-            rm_erm = sort_by_cohort(rm_erm, daily_roster)
-            er = sort_by_cohort(er, daily_roster)
+                rm_combined = alloc.get("rm", []) + alloc.get("erm", [])
+                
+                patient_assignments_dict[p_name]["soap"].extend(alloc.get("soap", []))
+                patient_assignments_dict[p_name]["rm_erm"].extend(rm_combined)
+                patient_assignments_dict[p_name]["er"].extend(alloc.get("er", []))
+                
+        for p in igds:
+            p_name = p["name"]
+            soap = sort_by_cohort(patient_assignments_dict[p_name]["soap"], daily_roster)
+            rm_erm = sort_by_cohort(patient_assignments_dict[p_name]["rm_erm"], daily_roster)
+            er = sort_by_cohort(patient_assignments_dict[p_name]["er"], daily_roster)
             
             igd_assignments.append({
-                "name": p["name"],
+                "name": p_name,
                 "soap": soap,
                 "rm_erm": rm_erm,
                 "er": er
@@ -1042,7 +1059,6 @@ with tab_use:
                     st.session_state.igd_rows = []
 
                 # Preload UI inputs once from Supabase assignment if it exists
-                # Unique key incorporates dates to reload when date changes
                 preload_key = f"_ui_preloaded_{picked_date}"
                 if saved_payload and not st.session_state.get(preload_key, False):
                     st.session_state.post_rows = [
@@ -1153,8 +1169,9 @@ with tab_use:
 
 # ---------- Tab Configuration (Seniority & Active Cohorts) ----------
 with tab_config:
-    st.subheader("⚙️ Konfigurasi Angkatan & Tingkat Jaga (Senioritas)")
-    st.write("Ubah status aktif angkatan dan pemetaan tingkat jaga (Jaga 1 - Jaga 4). Pengaturan ini akan tersimpan secara global di database.")
+    st.subheader("⚙️ Konfigurasi Angkatan & Jumlah Jaga (Beban Tugas)")
+    st.write("Ubah status aktif angkatan dan jumlah penugasan per orang. Pengaturan ini akan tersimpan secara global di database.")
+    st.info("Jumlah Jaga menentukan berapa shift tugas yang didapatkan masing-masing orang di angkatan tersebut (Jaga 1 = 1 tugas per hari, Jaga 2 = 2 tugas per hari, dst).")
     
     # Render table config input
     new_cohorts_config = {}
@@ -1171,9 +1188,15 @@ with tab_config:
         with c_col1:
             active = st.checkbox("Aktif dalam Pembagian", value=info.get("active", True), key=f"config_active_{key}")
         with c_col2:
-            levels = ["Jaga 1", "Jaga 2", "Jaga 3", "Jaga 4", "Observers"]
-            level_idx = levels.index(info.get("jaga_level", "Jaga 1")) if info.get("jaga_level", "Jaga 1") in levels else 0
-            jaga_level = st.selectbox("Level Penugasan", options=levels, index=level_idx, key=f"config_level_{key}", help="Jaga 1 & Observers -> SOAP/RM. Jaga 2 -> RM/TSR. Jaga 3/4 -> TSR/Supervisi.")
+            levels = ["Jaga 1", "Jaga 2", "Jaga 3", "Jaga 4"]
+            
+            # Backwards compatibility check
+            current_jaga_level = info.get("jaga_level", "Jaga 1")
+            if current_jaga_level == "Observers":
+                current_jaga_level = "Jaga 1"
+                
+            level_idx = levels.index(current_jaga_level) if current_jaga_level in levels else 0
+            jaga_level = st.selectbox("Jumlah Penugasan Jaga", options=levels, index=level_idx, key=f"config_level_{key}", help="Jaga 1 = 1 tugas/hari, Jaga 2 = 2 tugas/hari, Jaga 3 = 3 tugas/hari, Jaga 4 = 4 tugas/hari.")
             
         new_cohorts_config[key] = {
             "label": info["label"],

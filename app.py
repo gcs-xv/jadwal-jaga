@@ -130,7 +130,7 @@ DEFAULT_CONFIG = {
         "a13": {"label": "Angkatan 13", "active": True, "jaga_level": "Jaga 3", "csv_col": "a13"},
         "a14": {"label": "Angkatan 14", "active": True, "jaga_level": "Jaga 2", "csv_col": "a14"},
         "a15": {"label": "Angkatan 15", "active": True, "jaga_level": "Jaga 2", "csv_col": "a15"},
-        "observers": {"label": "Observers (A16)", "active": True, "jaga_level": "Jaga 1", "csv_col": "observers"}
+        "observers": {"label": "Observers (A16)", "active": True, "jaga_level": "Jaga 5", "csv_col": "observers"}
     },
     "blacklist": [
         ["Ferrel", "Maman"]
@@ -356,69 +356,87 @@ def get_cohort_display_label(config: dict, cohort_key: str) -> str:
 # ---------- Proportional Fair Distribution Algorithms ----------
 def distribute_cohort_to_roles(residents: list[str], patients: list[dict], weight: int, iso_date: str, salt: str, role_keys: list[str] = ["soap", "rm", "erm", "tsr"]) -> dict:
     """
-    Distribute residents of a cohort to the patient role slots.
-    Each resident is assigned to exactly 'weight' distinct role slots.
+    Distribute residents of a cohort to the patient role slots as evenly as possible.
     Returns a dict: { patient_name: { role_key: [names] } }
     """
     m = len(patients)
     n = len(residents)
+    r_len = len(role_keys)
     
     # Initialize empty assignments
     assignments = {p["name"]: {rk: [] for rk in role_keys} for p in patients}
     
-    if m == 0 or n == 0 or weight <= 0:
+    if m == 0 or n == 0:
         return assignments
         
     sh_res = shuffled(residents, iso_date, salt)
     
-    # We loop over residents. For each resident, we assign them to exactly 'weight' distinct slots.
-    for r in sh_res:
-        assigned_slots = set() # Set of (patient_name, role_key) assigned to resident r
+    # Total slots to fill
+    total_slots_to_fill = m * r_len
+    
+    base_slots = [(pat_idx, rk) for pat_idx in range(m) for rk in role_keys]
+    
+    if n >= total_slots_to_fill:
+        # Case 1: More or equal residents than total slots.
+        # Each resident is assigned to exactly 1 slot.
+        # We replicate slots to match n.
+        slots = base_slots * (n // total_slots_to_fill) + base_slots[: n % total_slots_to_fill]
         
-        max_possible_slots = m * len(role_keys)
-        actual_weight = min(weight, max_possible_slots)
+        # Shuffle slots
+        rng_slots = seeded_rng(iso_date, f"{salt}:slots_shuf")
+        rng_slots.shuffle(slots)
         
-        for _ in range(actual_weight):
-            best_p = None
-            best_rk = None
-            min_score = float('inf')
+        for idx, r in enumerate(sh_res):
+            pat_idx, rk = slots[idx]
+            p_name = patients[pat_idx]["name"]
+            assignments[p_name][rk].append(r)
+    else:
+        # Case 2: Fewer residents than total slots.
+        # Each resident covers target_counts slots.
+        target_counts = [total_slots_to_fill // n] * n
+        for i in range(total_slots_to_fill % n):
+            target_counts[i] += 1
             
-            # Shuffle keys deterministically for fair tie-breaking
-            patient_names = [p["name"] for p in patients]
-            rng_p = seeded_rng(iso_date, f"{salt}:sel_pat:{r}:{_}")
-            rng_p.shuffle(patient_names)
+        res_targets = {sh_res[i]: target_counts[i] for i in range(n)}
+        res_counts = {r: 0 for r in sh_res}
+        
+        # Shuffle slots to assign
+        slots = list(base_slots)
+        rng_slots = seeded_rng(iso_date, f"{salt}:slots_shuf")
+        rng_slots.shuffle(slots)
+        
+        for pat_idx, rk in slots:
+            p_name = patients[pat_idx]["name"]
             
-            sh_role_keys = list(role_keys)
-            rng_r = seeded_rng(iso_date, f"{salt}:sel_role:{r}:{_}")
-            rng_r.shuffle(sh_role_keys)
+            best_r = None
+            min_patient_count = float('inf')
+            min_total_count = float('inf')
             
-            for p_name in patient_names:
-                r_p_count = sum(1 for rk in role_keys if r in assignments[p_name][rk])
-                
-                for rk in sh_role_keys:
-                    if (p_name, rk) in assigned_slots:
-                        continue
-                        
-                    cohort_role_count = len(assignments[p_name][rk])
+            # Shuffle residents for fair tie-breaking
+            sh_res_candidates = list(sh_res)
+            rng_cand = seeded_rng(iso_date, f"{salt}:cand:{pat_idx}:{rk}")
+            rng_cand.shuffle(sh_res_candidates)
+            
+            for r in sh_res_candidates:
+                if res_counts[r] < res_targets[r]:
+                    # Count how many times this resident is assigned to this patient across all roles
+                    r_p_count = sum(1 for role in role_keys if r in assignments[p_name][role])
                     
-                    # Score: prioritize patients with fewest assignments for this resident,
-                    # then role slots with fewest total cohort residents.
-                    score = (r_p_count * 1000) + cohort_role_count
-                    
-                    if score < min_score:
-                        min_score = score
-                        best_p = p_name
-                        best_rk = rk
+                    # We want to minimize r_p_count first (spread across patients), then total assignments
+                    if r_p_count < min_patient_count or (r_p_count == min_patient_count and res_counts[r] < min_total_count):
+                        min_patient_count = r_p_count
+                        min_total_count = res_counts[r]
+                        best_r = r
                         
-            if best_p and best_rk:
-                assignments[best_p][best_rk].append(r)
-                assigned_slots.add((best_p, best_rk))
+            if best_r:
+                assignments[p_name][rk].append(best_r)
+                res_counts[best_r] += 1
                 
     return assignments
 
 def distribute_cohort_to_patients_with_weight(residents: list[str], patients: list[dict], weight: int, iso_date: str, salt: str) -> list[list[str]]:
     """
-    Distribute residents of a cohort to patients such that each resident covers 'weight' patients.
+    Distribute residents of a cohort to patients as evenly as possible.
     Returns a list of lists of names for each patient.
     """
     m = len(patients)
@@ -426,34 +444,59 @@ def distribute_cohort_to_patients_with_weight(residents: list[str], patients: li
     
     assignments = [[] for _ in range(m)]
     
-    if m == 0 or n == 0 or weight <= 0:
+    if m == 0 or n == 0:
         return assignments
         
     sh_res = shuffled(residents, iso_date, salt)
     
-    for r in sh_res:
-        assigned_patients = set()
-        actual_weight = min(weight, m)
+    if n >= m:
+        # Case 1: More or equal residents than patients.
+        # Each resident is assigned to exactly 1 patient.
+        # We replicate patient slots to match n.
+        slots = list(range(m)) * (n // m) + list(range(m))[: n % m]
+        # Shuffle slots to make distribution random/fair
+        rng_slots = seeded_rng(iso_date, f"{salt}:slots_shuf")
+        rng_slots.shuffle(slots)
         
-        for _ in range(actual_weight):
-            best_idx = -1
+        for idx, r in enumerate(sh_res):
+            pat_idx = slots[idx]
+            assignments[pat_idx].append(r)
+    else:
+        # Case 2: Fewer residents than patients.
+        # We distribute the m patients among the n residents.
+        # target_counts is the number of patients each resident covers.
+        target_counts = [m // n] * n
+        for i in range(m % n):
+            target_counts[i] += 1
+            
+        # Match target_counts to shuffled residents
+        res_targets = {sh_res[i]: target_counts[i] for i in range(n)}
+        res_counts = {r: 0 for r in sh_res}
+        
+        # Shuffle patient indices
+        patient_indices = list(range(m))
+        rng_pat = seeded_rng(iso_date, f"{salt}:pat_shuf")
+        rng_pat.shuffle(patient_indices)
+        
+        for pat_idx in patient_indices:
+            best_r = None
             min_count = float('inf')
             
-            patient_indices = list(range(m))
-            rng = seeded_rng(iso_date, f"{salt}:r_pat:{r}:{_}")
-            rng.shuffle(patient_indices)
+            # Shuffle residents for fair tie-breaking
+            sh_res_candidates = list(sh_res)
+            rng_cand = seeded_rng(iso_date, f"{salt}:cand:{pat_idx}")
+            rng_cand.shuffle(sh_res_candidates)
             
-            for idx in patient_indices:
-                if idx in assigned_patients:
-                    continue
-                count = len(assignments[idx])
-                if count < min_count:
-                    min_count = count
-                    best_idx = idx
-                    
-            if best_idx != -1:
-                assignments[best_idx].append(r)
-                assigned_patients.add(best_idx)
+            for r in sh_res_candidates:
+                if res_counts[r] < res_targets[r]:
+                    if r not in assignments[pat_idx]:
+                        if res_counts[r] < min_count:
+                            min_count = res_counts[r]
+                            best_r = r
+                            
+            if best_r:
+                assignments[pat_idx].append(best_r)
+                res_counts[best_r] += 1
                 
     return assignments
 
@@ -1180,7 +1223,7 @@ with tab_use:
 with tab_config:
     st.subheader("⚙️ Konfigurasi Angkatan & Jumlah Jaga (Beban Tugas)")
     st.write("Ubah status aktif angkatan dan jumlah penugasan per orang. Pengaturan ini akan tersimpan secara global di database.")
-    st.info("Jumlah Jaga menentukan berapa shift tugas yang didapatkan masing-masing orang di angkatan tersebut (Jaga 1 = 1 tugas per hari, Jaga 2 = 2 tugas per hari, dst).")
+    st.info("Jumlah Jaga merepresentasikan jumlah residen dari angkatan tersebut yang bertugas pada hari itu (Jaga 1 = 1 orang bertugas, Jaga 2 = 2 orang bertugas, dst).")
     
     # Render table config input
     new_cohorts_config = {}
@@ -1202,15 +1245,15 @@ with tab_config:
         with c_col1:
             active = st.checkbox("Aktif dalam Pembagian", value=info.get("active", True), key=f"config_active_{key}")
         with c_col2:
-            levels = ["Jaga 1", "Jaga 2", "Jaga 3", "Jaga 4"]
+            levels = ["Jaga 1", "Jaga 2", "Jaga 3", "Jaga 4", "Jaga 5"]
             
             # Backwards compatibility check
             current_jaga_level = info.get("jaga_level", "Jaga 1")
             if current_jaga_level == "Observers":
-                current_jaga_level = "Jaga 1"
+                current_jaga_level = "Jaga 5"
                 
             level_idx = levels.index(current_jaga_level) if current_jaga_level in levels else 0
-            jaga_level = st.selectbox("Jumlah Penugasan Jaga", options=levels, index=level_idx, key=f"config_level_{key}", help="Jaga 1 = 1 tugas/hari, Jaga 2 = 2 tugas/hari, Jaga 3 = 3 tugas/hari, Jaga 4 = 4 tugas/hari.")
+            jaga_level = st.selectbox("Jumlah Penugasan Jaga", options=levels, index=level_idx, key=f"config_level_{key}", help="Jaga 1 = 1 orang bertugas, Jaga 2 = 2 orang bertugas, ..., Jaga 5 = 5 orang bertugas.")
             
         new_cohorts_config[key] = {
             "label": info["label"],

@@ -1059,25 +1059,17 @@ with tab_use:
                 
                 with pc2:
                     pilot_names = roster_to_use.get(pilot_cohort, [])
-                    options_p = ["-- Pilih --"] + pilot_names + (["Manual: " + default_pilot] if default_pilot and default_pilot not in pilot_names else []) + ["Ketik Manual..."]
-                    
-                    if default_pilot in pilot_names:
-                        p_idx = options_p.index(default_pilot)
-                    elif default_pilot and ("Manual: " + default_pilot) in options_p:
-                        p_idx = options_p.index("Manual: " + default_pilot)
+                    if len(pilot_names) == 1:
+                        st.text_input("Nama Pilot", value=pilot_names[0], disabled=True, key=f"pilot_disp_{picked_date}")
+                        pilot_name = pilot_names[0]
+                    elif len(pilot_names) > 1:
+                        options_p = ["-- Pilih --"] + pilot_names
+                        p_idx = options_p.index(default_pilot) if default_pilot in pilot_names else 0
+                        selected_pilot = st.selectbox("Nama Pilot", options=options_p, index=p_idx, key=f"pilot_sel_{picked_date}")
+                        pilot_name = "" if selected_pilot == "-- Pilih --" else selected_pilot
                     else:
-                        p_idx = 0
-                        
-                    selected_pilot_opt = st.selectbox("Nama Pilot", options=options_p, index=p_idx)
-                    
-                    if selected_pilot_opt == "Ketik Manual...":
-                        pilot_name = st.text_input("Ketik Nama Pilot Manual")
-                    elif selected_pilot_opt.startswith("Manual: "):
-                        pilot_name = selected_pilot_opt.replace("Manual: ", "")
-                    elif selected_pilot_opt == "-- Pilih --":
+                        st.text_input("Nama Pilot", value="Tidak ada residen", disabled=True, key=f"pilot_disp_none_{picked_date}")
                         pilot_name = ""
-                    else:
-                        pilot_name = selected_pilot_opt
 
                 with pc3:
                     copilot_idx = active_keys_ordered.index(default_copilot_c) if default_copilot_c in active_keys_ordered else 0
@@ -1085,25 +1077,17 @@ with tab_use:
                 
                 with pc4:
                     copilot_names = roster_to_use.get(copilot_cohort, [])
-                    options_cp = ["-- Pilih --"] + copilot_names + (["Manual: " + default_copilot] if default_copilot and default_copilot not in copilot_names else []) + ["Ketik Manual..."]
-                    
-                    if default_copilot in copilot_names:
-                        cp_idx = options_cp.index(default_copilot)
-                    elif default_copilot and ("Manual: " + default_copilot) in options_cp:
-                        cp_idx = options_cp.index("Manual: " + default_copilot)
+                    if len(copilot_names) == 1:
+                        st.text_input("Nama Co-Pilot", value=copilot_names[0], disabled=True, key=f"copilot_disp_{picked_date}")
+                        copilot_name = copilot_names[0]
+                    elif len(copilot_names) > 1:
+                        options_cp = ["-- Pilih --"] + copilot_names
+                        cp_idx = options_cp.index(default_copilot) if default_copilot in copilot_names else 0
+                        selected_copilot = st.selectbox("Nama Co-Pilot", options=options_cp, index=cp_idx, key=f"copilot_sel_{picked_date}")
+                        copilot_name = "" if selected_copilot == "-- Pilih --" else selected_copilot
                     else:
-                        cp_idx = 0
-                        
-                    selected_copilot_opt = st.selectbox("Nama Co-Pilot", options=options_cp, index=cp_idx)
-                    
-                    if selected_copilot_opt == "-- Pilih --":
+                        st.text_input("Nama Co-Pilot", value="Tidak ada residen", disabled=True, key=f"copilot_disp_none_{picked_date}")
                         copilot_name = ""
-                    elif selected_copilot_opt == "Ketik Manual...":
-                        copilot_name = st.text_input("Ketik Nama Co-Pilot Manual")
-                    elif selected_copilot_opt.startswith("Manual: "):
-                        copilot_name = selected_copilot_opt.replace("Manual: ", "")
-                    else:
-                        copilot_name = selected_copilot_opt
 
             st.markdown("---")
 

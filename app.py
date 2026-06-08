@@ -126,11 +126,11 @@ def invalidate_caches():
 # ---------- Global Configuration & Seniority Setup ----------
 DEFAULT_CONFIG = {
     "cohorts": {
-        "a12": {"label": "Angkatan 12", "active": True, "jaga_level": "Jaga 4"},
-        "a13": {"label": "Angkatan 13", "active": True, "jaga_level": "Jaga 3"},
-        "a14": {"label": "Angkatan 14", "active": True, "jaga_level": "Jaga 2"},
-        "a15": {"label": "Angkatan 15", "active": True, "jaga_level": "Jaga 2"},
-        "observers": {"label": "Observers (A16)", "active": True, "jaga_level": "Jaga 1"}
+        "a12": {"label": "Angkatan 12", "active": True, "jaga_level": "Jaga 4", "csv_col": "a12"},
+        "a13": {"label": "Angkatan 13", "active": True, "jaga_level": "Jaga 3", "csv_col": "a13"},
+        "a14": {"label": "Angkatan 14", "active": True, "jaga_level": "Jaga 2", "csv_col": "a14"},
+        "a15": {"label": "Angkatan 15", "active": True, "jaga_level": "Jaga 2", "csv_col": "a15"},
+        "observers": {"label": "Observers (A16)", "active": True, "jaga_level": "Jaga 1", "csv_col": "observers"}
     },
     "blacklist": [
         ["Ferrel", "Maman"]
@@ -188,19 +188,6 @@ def upsert_assignment(month: str, date: str, payload: dict):
     invalidate_caches()
 
 # ---------- CSV import utils ----------
-REQUIRED_CSV_COLUMNS = [
-    "month",
-    "date",
-    "dpjp",
-    "pilot",
-    "copilot",
-    "a12",
-    "a13",
-    "a14",
-    "a15",
-    "observers",
-]
-
 def split_pipe_list(value: str):
     s = (value or "").strip()
     if not s:
@@ -226,9 +213,21 @@ def parse_roster_csv(uploaded_file):
     if reader.fieldnames:
         reader.fieldnames = fieldnames
 
-    missing = [c for c in REQUIRED_CSV_COLUMNS if c not in fieldnames]
-    if missing:
-        raise ValueError(f"CSV missing columns: {', '.join(missing)}")
+    # Check if necessary columns are present
+    meta_cols = ["month", "date", "dpjp", "pilot", "copilot"]
+    missing_meta = [c for c in meta_cols if c not in fieldnames]
+    if missing_meta:
+        raise ValueError(f"CSV missing essential columns: {', '.join(missing_meta)}")
+
+    # Cohort columns are any headers that are not meta
+    cohort_cols = [c for c in fieldnames if c not in meta_cols]
+    if not cohort_cols:
+        raise ValueError("CSV has no cohort columns (needs at least one column for resident rosters)")
+        
+    db_cols = ["a12", "a13", "a14", "a15", "observers"]
+    mapping = {}
+    for i, col in enumerate(cohort_cols[:5]):
+        mapping[db_cols[i]] = col
 
     rows = []
     for r in reader:
@@ -237,21 +236,27 @@ def parse_roster_csv(uploaded_file):
         if not month or not date:
             continue
 
-        rows.append({
+        # Parse CSV row and map to DB columns
+        row_data = {
             "month": month,
             "date": date,
             "dpjp": (r.get("dpjp") or "").strip(),
             "pilot": (r.get("pilot") or "").strip(),
             "copilot": (r.get("copilot") or "").strip(),
-            "a12": split_pipe_list(r.get("a12") or ""),
-            "a13": split_pipe_list(r.get("a13") or ""),
-            "a14": split_pipe_list(r.get("a14") or ""),
-            "a15": split_pipe_list(r.get("a15") or ""),
-            "observers": split_pipe_list(r.get("observers") or ""),
-            "erm_manual": "",
-            "review_manual": "",
-        })
-    return rows
+        }
+        
+        # Populate mapped cohort columns
+        for db_col, csv_col in mapping.items():
+            row_data[db_col] = split_pipe_list(r.get(csv_col) or "")
+            
+        # Set empty list for any unmapped DB columns
+        for db_col in db_cols:
+            if db_col not in row_data:
+                row_data[db_col] = []
+                
+        rows.append(row_data)
+        
+    return rows, mapping
 
 # ---------- Assignment generation helpers ----------
 DAY_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
@@ -341,6 +346,12 @@ def get_jaga_weight(config: dict, cohort_key: str) -> int:
     elif jaga_level_str.lower() == "observers":
         weight = 1
     return weight
+
+# ---------- Helper to get WA Output Label (e.g. Angkatan 13 -> A13) ----------
+def get_cohort_display_label(config: dict, cohort_key: str) -> str:
+    label = config.get("cohorts", {}).get(cohort_key, {}).get("label", cohort_key.upper())
+    label = label.replace("Angkatan ", "A")
+    return label
 
 # ---------- Proportional Fair Distribution Algorithms ----------
 def distribute_cohort_to_roles(residents: list[str], patients: list[dict], weight: int, iso_date: str, salt: str, role_keys: list[str] = ["soap", "rm", "erm", "tsr"]) -> dict:
@@ -833,14 +844,17 @@ def build_assignment(roster: dict, iso_date: str, post_ops: list, pre_ops: list,
     return out
 
 # ---------- WA Formatter ----------
-def format_wa_text(assign: dict) -> str:
+def format_wa_text(assign: dict, config: dict) -> str:
     day = assign["day_name"]
     iso = assign["date"]
     dd, mm, yyyy = iso.split("-")[2], iso.split("-")[1], iso.split("-")[0]
     header = f"Pembagian tugas jaga {day}, {dd}/{mm}/{yyyy}\n\n"
     
-    pilot_lbl = f" ({assign['pilot_cohort'].upper()})" if assign.get("pilot_cohort") else ""
-    copilot_lbl = f" ({assign['copilot_cohort'].upper()})" if assign.get("copilot_cohort") else ""
+    pilot_cohort_name = get_cohort_display_label(config, assign.get("pilot_cohort", "")) if assign.get("pilot_cohort") else ""
+    copilot_cohort_name = get_cohort_display_label(config, assign.get("copilot_cohort", "")) if assign.get("copilot_cohort") else ""
+    
+    pilot_lbl = f" ({pilot_cohort_name})" if pilot_cohort_name else ""
+    copilot_lbl = f" ({copilot_cohort_name})" if copilot_cohort_name else ""
     
     header += f"Pilot : {assign.get('pilot','')}{pilot_lbl}\n"
     header += f"Co Pilot : {assign.get('copilot','')}{copilot_lbl}\n\n"
@@ -920,7 +934,7 @@ with tab_use:
             st.info("Tanggal ini belum ada roster. Tambah roster di tab Admin atau pilih tanggal lain.")
         else:
             # Active cohorts according to global config
-            active_keys = [k for k, v in global_config["cohorts"].items() if v.get("active", True)]
+            active_keys = [k for k, v in global_config["cohorts"].items() if v.get("active", True) and v.get("csv_col", "")]
             
             # 1. Roster Viewer and Editable Overrides
             with st.expander("📋 Tim Jaga Hari Ini (Roster)", expanded=False):
@@ -930,7 +944,7 @@ with tab_use:
                 override_roster = {}
                 for key in ["a12", "a13", "a14", "a15", "observers"]:
                     label = global_config["cohorts"].get(key, {}).get("label", key.upper())
-                    is_active = global_config["cohorts"].get(key, {}).get("active", True)
+                    is_active = global_config["cohorts"].get(key, {}).get("active", True) and global_config["cohorts"].get(key, {}).get("csv_col", "")
                     
                     if is_active:
                         default_val = ", ".join(r.get(key, []))
@@ -939,7 +953,7 @@ with tab_use:
                         if ss_key not in st.session_state:
                             st.session_state[ss_key] = default_val
                             
-                        override_val = st.text_input(f"{label} ({'Active' if is_active else 'Inactive'})", value=st.session_state[ss_key], key=f"ti_{ss_key}")
+                        override_val = st.text_input(f"{label}", value=st.session_state[ss_key], key=f"ti_{ss_key}")
                         st.session_state[ss_key] = override_val
                         override_roster[key] = [x.strip() for x in override_val.split(",") if x.strip()]
                     else:
@@ -976,75 +990,70 @@ with tab_use:
             default_pilot = saved_payload.get("pilot", r.get("pilot", "")) if saved_payload else r.get("pilot", "")
             default_copilot = saved_payload.get("copilot", r.get("copilot", "")) if saved_payload else r.get("copilot", "")
             
-            # If the saved pilot/copilot names are in the roster list, find their cohort
-            default_pilot_c = saved_payload.get("pilot_cohort", find_resident_cohort(default_pilot, roster_to_use) or "a13") if saved_payload else (find_resident_cohort(default_pilot, roster_to_use) or "a13")
-            default_copilot_c = saved_payload.get("copilot_cohort", find_resident_cohort(default_copilot, roster_to_use) or "a14") if saved_payload else (find_resident_cohort(default_copilot, roster_to_use) or "a14")
+            default_pilot_c = saved_payload.get("pilot_cohort", find_resident_cohort(default_pilot, roster_to_use) or (active_keys[0] if active_keys else "a13")) if saved_payload else (find_resident_cohort(default_pilot, roster_to_use) or (active_keys[0] if active_keys else "a13"))
+            default_copilot_c = saved_payload.get("copilot_cohort", find_resident_cohort(default_copilot, roster_to_use) or (active_keys[1] if len(active_keys) > 1 else (active_keys[0] if active_keys else "a14"))) if saved_payload else (find_resident_cohort(default_copilot, roster_to_use) or (active_keys[1] if len(active_keys) > 1 else (active_keys[0] if active_keys else "a14")))
             
             # Pilot / Co-Pilot Dropdowns
             st.markdown("##### ✈️ Koordinator Jaga (Pilot & Co-Pilot)")
             pc1, pc2, pc3, pc4 = st.columns(4)
             
-            active_labels = {k: v["label"] for k, v in global_config["cohorts"].items() if v.get("active", True)}
+            active_labels = {k: v["label"] for k, v in global_config["cohorts"].items() if v.get("active", True) and v.get("csv_col", "")}
             active_keys_ordered = [k for k in ["a12", "a13", "a14", "a15", "observers"] if k in active_labels]
             
-            with pc1:
-                # Pilot Cohort Select
-                pilot_idx = active_keys_ordered.index(default_pilot_c) if default_pilot_c in active_keys_ordered else 0
-                pilot_cohort = st.selectbox("Pilot Angkatan", options=active_keys_ordered, format_func=lambda x: active_labels[x], index=pilot_idx)
-            
-            with pc2:
-                # Pilot Name Select
-                pilot_names = roster_to_use.get(pilot_cohort, [])
-                # Add "Manual / No One" option
-                options_p = ["-- Pilih --"] + pilot_names + (["Manual: " + default_pilot] if default_pilot and default_pilot not in pilot_names else []) + ["Ketik Manual..."]
+            if not active_keys_ordered:
+                st.warning("Silakan aktifkan setidaknya satu angkatan di tab Konfigurasi Angkatan.")
+            else:
+                with pc1:
+                    pilot_idx = active_keys_ordered.index(default_pilot_c) if default_pilot_c in active_keys_ordered else 0
+                    pilot_cohort = st.selectbox("Pilot Angkatan", options=active_keys_ordered, format_func=lambda x: active_labels[x], index=pilot_idx)
                 
-                # Determine index
-                if default_pilot in pilot_names:
-                    p_idx = options_p.index(default_pilot)
-                elif default_pilot and ("Manual: " + default_pilot) in options_p:
-                    p_idx = options_p.index("Manual: " + default_pilot)
-                else:
-                    p_idx = 0
+                with pc2:
+                    pilot_names = roster_to_use.get(pilot_cohort, [])
+                    options_p = ["-- Pilih --"] + pilot_names + (["Manual: " + default_pilot] if default_pilot and default_pilot not in pilot_names else []) + ["Ketik Manual..."]
                     
-                selected_pilot_opt = st.selectbox("Nama Pilot", options=options_p, index=p_idx)
-                
-                if selected_pilot_opt == "Ketik Manual...":
-                    pilot_name = st.text_input("Ketik Nama Pilot Manual")
-                elif selected_pilot_opt.startswith("Manual: "):
-                    pilot_name = selected_pilot_opt.replace("Manual: ", "")
-                elif selected_pilot_opt == "-- Pilih --":
-                    pilot_name = ""
-                else:
-                    pilot_name = selected_pilot_opt
+                    if default_pilot in pilot_names:
+                        p_idx = options_p.index(default_pilot)
+                    elif default_pilot and ("Manual: " + default_pilot) in options_p:
+                        p_idx = options_p.index("Manual: " + default_pilot)
+                    else:
+                        p_idx = 0
+                        
+                    selected_pilot_opt = st.selectbox("Nama Pilot", options=options_p, index=p_idx)
+                    
+                    if selected_pilot_opt == "Ketik Manual...":
+                        pilot_name = st.text_input("Ketik Nama Pilot Manual")
+                    elif selected_pilot_opt.startswith("Manual: "):
+                        pilot_name = selected_pilot_opt.replace("Manual: ", "")
+                    elif selected_pilot_opt == "-- Pilih --":
+                        pilot_name = ""
+                    else:
+                        pilot_name = selected_pilot_opt
 
-            with pc3:
-                # Co-Pilot Cohort Select
-                copilot_idx = active_keys_ordered.index(default_copilot_c) if default_copilot_c in active_keys_ordered else 0
-                copilot_cohort = st.selectbox("Co-Pilot Angkatan", options=active_keys_ordered, format_func=lambda x: active_labels[x], index=copilot_idx)
-            
-            with pc4:
-                # Co-Pilot Name Select
-                copilot_names = roster_to_use.get(copilot_cohort, [])
-                options_cp = ["-- Pilih --"] + copilot_names + (["Manual: " + default_copilot] if default_copilot and default_copilot not in copilot_names else []) + ["Ketik Manual..."]
+                with pc3:
+                    copilot_idx = active_keys_ordered.index(default_copilot_c) if default_copilot_c in active_keys_ordered else 0
+                    copilot_cohort = st.selectbox("Co-Pilot Angkatan", options=active_keys_ordered, format_func=lambda x: active_labels[x], index=copilot_idx)
                 
-                # Determine index
-                if default_copilot in copilot_names:
-                    cp_idx = options_cp.index(default_copilot)
-                elif default_copilot and ("Manual: " + default_copilot) in options_cp:
-                    cp_idx = options_cp.index("Manual: " + default_copilot)
-                else:
-                    cp_idx = 0
+                with pc4:
+                    copilot_names = roster_to_use.get(copilot_cohort, [])
+                    options_cp = ["-- Pilih --"] + copilot_names + (["Manual: " + default_copilot] if default_copilot and default_copilot not in copilot_names else []) + ["Ketik Manual..."]
                     
-                selected_copilot_opt = st.selectbox("Nama Co-Pilot", options=options_cp, index=cp_idx)
-                
-                if selected_copilot_opt == "-- Pilih --":
-                    copilot_name = ""
-                elif selected_copilot_opt == "Ketik Manual...":
-                    copilot_name = st.text_input("Ketik Nama Co-Pilot Manual")
-                elif selected_copilot_opt.startswith("Manual: "):
-                    copilot_name = selected_copilot_opt.replace("Manual: ", "")
-                else:
-                    copilot_name = selected_copilot_opt
+                    if default_copilot in copilot_names:
+                        cp_idx = options_cp.index(default_copilot)
+                    elif default_copilot and ("Manual: " + default_copilot) in options_cp:
+                        cp_idx = options_cp.index("Manual: " + default_copilot)
+                    else:
+                        cp_idx = 0
+                        
+                    selected_copilot_opt = st.selectbox("Nama Co-Pilot", options=options_cp, index=cp_idx)
+                    
+                    if selected_copilot_opt == "-- Pilih --":
+                        copilot_name = ""
+                    elif selected_copilot_opt == "Ketik Manual...":
+                        copilot_name = st.text_input("Ketik Nama Co-Pilot Manual")
+                    elif selected_copilot_opt.startswith("Manual: "):
+                        copilot_name = selected_copilot_opt.replace("Manual: ", "")
+                    else:
+                        copilot_name = selected_copilot_opt
 
             st.markdown("---")
 
@@ -1139,7 +1148,7 @@ with tab_use:
             igds = [{"name": x.get("name","").strip(), "meta": ""} for x in (st.session_state.get("igd_rows") or []) if (x.get("name") or "").strip()]
 
             # Generate shift distribution
-            if st.button("Generate Pembagian"):
+            if st.button("Generate Pembagian") and active_keys_ordered:
                 pilot_info = {"cohort": pilot_cohort, "name": pilot_name}
                 copilot_info = {"cohort": copilot_cohort, "name": copilot_name}
                 
@@ -1155,7 +1164,7 @@ with tab_use:
                     pilot_info=pilot_info,
                     copilot_info=copilot_info
                 )
-                wa = format_wa_text(assign)
+                wa = format_wa_text(assign, global_config)
                 upsert_assignment(picked_month, picked_date, assign)
 
                 st.success("✅ Pembagian berhasil dibuat & disimpan ke database.")
@@ -1164,7 +1173,7 @@ with tab_use:
             # Display saved assignment if it exists (but not generated yet this run)
             if saved_payload:
                 st.info("Ada pembagian tugas tersimpan untuk tanggal ini. Berikut adalah teks tersimpan:")
-                wa_saved = format_wa_text(saved_payload)
+                wa_saved = format_wa_text(saved_payload, global_config)
                 st.text_area("Teks Jaga Tersimpan", value=wa_saved, height=350)
 
 # ---------- Tab Configuration (Seniority & Active Cohorts) ----------
@@ -1182,7 +1191,12 @@ with tab_config:
     for key in standard_keys:
         info = global_config["cohorts"].get(key, DEFAULT_CONFIG["cohorts"][key])
         
-        st.markdown(f"##### **{info['label']}**")
+        # Only show config if the cohort column was mapped in the CSV
+        csv_col_name = info.get("csv_col", "")
+        if not csv_col_name:
+            continue
+            
+        st.markdown(f"##### **{info['label']}** (Mapped from CSV column: `{csv_col_name}`)")
         c_col1, c_col2 = st.columns(2)
         
         with c_col1:
@@ -1201,8 +1215,14 @@ with tab_config:
         new_cohorts_config[key] = {
             "label": info["label"],
             "active": active,
-            "jaga_level": jaga_level
+            "jaga_level": jaga_level,
+            "csv_col": csv_col_name
         }
+        
+    # Preserving unmapped columns in configuration
+    for key in standard_keys:
+        if key not in new_cohorts_config:
+            new_cohorts_config[key] = global_config["cohorts"].get(key, DEFAULT_CONFIG["cohorts"][key])
         
     st.markdown("---")
     st.subheader("🚫 Blacklist Pairing (Anti-Kombinasi)")
@@ -1247,14 +1267,14 @@ with tab_admin:
     pin = st.text_input("Admin PIN", type="password")
     is_admin = (pin.strip() == ADMIN_PIN)
 
-    csv_file = st.file_uploader("Upload CSV Roster (month,date,dpjp,pilot,copilot,a12,a13,a14,a15,observers)", type=["csv"])
+    csv_file = st.file_uploader("Upload CSV Roster (month,date,dpjp,pilot,copilot, + cohort columns)", type=["csv"])
 
     if st.button("IMPORT CSV → isi roster_days", disabled=not is_admin):
         if not csv_file:
             st.error("Upload CSV dulu.")
         else:
             try:
-                rows = parse_roster_csv(csv_file)
+                rows, mapping = parse_roster_csv(csv_file)
             except Exception as e:
                 st.error("Gagal baca CSV:")
                 st.code(str(e))
@@ -1273,8 +1293,37 @@ with tab_admin:
             for r in rows:
                 upsert_roster_day(r)
 
+            # Update the global config with mapped cohort labels dynamically
+            config = fetch_global_config()
+            db_cols = ["a12", "a13", "a14", "a15", "observers"]
+            
+            for db_col, csv_col in mapping.items():
+                label = csv_col.replace("a", "Angkatan ").title()
+                if csv_col.lower() == "observers":
+                    label = "Observers"
+                    
+                config["cohorts"][db_col] = {
+                    "label": label,
+                    "active": config["cohorts"].get(db_col, {}).get("active", True),
+                    "jaga_level": config["cohorts"].get(db_col, {}).get("jaga_level", "Jaga 1"),
+                    "csv_col": csv_col
+                }
+                
+            # Clear out mapping for unmapped DB columns (not present in this CSV)
+            for db_col in db_cols:
+                if db_col not in mapping:
+                    config["cohorts"][db_col] = {
+                        "label": f"Tidak Dipakai ({db_col.upper()})",
+                        "active": False,
+                        "jaga_level": "Jaga 1",
+                        "csv_col": ""
+                    }
+                    
+            save_global_config(config)
+
             # Invalidate Streamlit cache immediately
             invalidate_caches()
 
-            st.success(f"✅ Import sukses: {len(rows)} tanggal terisi untuk bulan: {', '.join(months_in_csv)}")
+            st.success(f"✅ Import sukses: {len(rows)} tanggal terisi. Konfigurasi angkatan telah disesuaikan secara otomatis!")
             st.info("Coba cek tab Pakai untuk tanggal tertentu.")
+            st.rerun()

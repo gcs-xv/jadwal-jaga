@@ -150,6 +150,13 @@ def fetch_global_config():
                 for k, v in DEFAULT_CONFIG["cohorts"].items():
                     if k not in config["cohorts"]:
                         config["cohorts"][k] = v
+                    else:
+                        for prop, val in v.items():
+                            if prop not in config["cohorts"][k]:
+                                config["cohorts"][k][prop] = val
+                            # If csv_col is empty in the database, restore the default csv_col mapping to keep it active
+                            if prop == "csv_col" and not config["cohorts"][k].get("csv_col"):
+                                config["cohorts"][k]["csv_col"] = val
             if "blacklist" not in config:
                 config["blacklist"] = DEFAULT_CONFIG["blacklist"]
             return config
@@ -1234,12 +1241,12 @@ with tab_config:
     for key in standard_keys:
         info = global_config["cohorts"].get(key, DEFAULT_CONFIG["cohorts"][key])
         
-        # Only show config if the cohort column was mapped in the CSV
         csv_col_name = info.get("csv_col", "")
-        if not csv_col_name:
-            continue
+        if csv_col_name:
+            st.markdown(f"##### **{info['label']}** (Mapped from CSV column: `{csv_col_name}`)")
+        else:
+            st.markdown(f"##### **{info['label']}** *(Belum terpetakan dari CSV)*")
             
-        st.markdown(f"##### **{info['label']}** (Mapped from CSV column: `{csv_col_name}`)")
         c_col1, c_col2 = st.columns(2)
         
         with c_col1:
